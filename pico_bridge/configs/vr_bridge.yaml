@@ -1,0 +1,9 @@
+# ZeroMQ配置
+zmq:
+  ipc_addr: "ipc:///tmp/vr_data.ipc"
+
+# 数据发布频率（Hz）
+publish_rate: 80
+
+# ZeroMQ高水位标记（消息缓冲区大小）
+buffer_size: 10

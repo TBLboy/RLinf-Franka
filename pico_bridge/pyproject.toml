@@ -1,0 +1,6 @@
+[project]
+name = "franka-pico-bridge"
+version = "0.1.0"
+description = "Pico XRoboToolkit state publisher for the Franka collection release"
+requires-python = ">=3.11,<3.12"
+dependencies = ["numpy", "pyyaml", "pyzmq"]

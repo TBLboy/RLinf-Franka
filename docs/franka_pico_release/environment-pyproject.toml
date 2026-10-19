@@ -1,0 +1,45 @@
+[project]
+name = "franka-pico-release"
+version = "0.1.0"
+description = "Stable Pico teleoperation and demonstration collection for one Franka Research 3 arm"
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+dependencies = [
+  "accelerate",
+  "datasets==3.6.0",
+  "einops",
+  "evdev",
+  "gymnasium==0.29.1",
+  "hydra-core<1.4.0.dev8",
+  "imageio[ffmpeg]",
+  "numpy<2",
+  "opencv-python",
+  "pyarrow>=15,<26",
+  "pymodbus>=3,<4",
+  "pyquaternion",
+  "pyserial",
+  "pyyaml",
+  "pyzmq",
+  "ray[default]>=2.47.0",
+  "scipy",
+  "tensorboard",
+  "torch>=2.5.0",
+  "torchdata",
+  "torchvision",
+]
+
+[dependency-groups]
+test = ["pytest", "ruff"]
+
+[tool.uv]
+override-dependencies = [
+  "datasets==3.6.0",
+  "protobuf>=6.33.5,<7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

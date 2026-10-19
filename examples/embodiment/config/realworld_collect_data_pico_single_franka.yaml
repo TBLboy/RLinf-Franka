@@ -1,0 +1,209 @@
+defaults:
+  - env/realworld_franka_sft_env@env.eval
+  - override hydra/job_logging: stdout
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
+  searchpath:
+    - file://${oc.env:EMBODIED_PATH}/config/
+
+cluster:
+  num_nodes: 1
+  component_placement:
+    env:
+      node_group: franka
+      placement: 0
+  node_groups:
+    - label: franka
+      node_ranks: 0
+      hardware:
+        type: Franka
+        configs:
+          # 单臂：Franka Research 3，Shop Floor 网段 172.16.0.2/24
+          - robot_ip: 172.16.0.2
+            node_rank: 0
+            # franky 走 libfranka，不需要 ROS（决策 D-005）
+            backend: franky
+            # 本机 PREEMPT_RT 内核，强制实时以保证控制周期（D-012）
+            realtime_config: enforce
+            # Franky 对相邻 TCP 目标的硬上限（m/次）。必须与下方
+            # override_cfg.action_scale[0] 同步：只提高其中一个仍会被另一个
+            # 截回。2026-10-15 空载跟手第一档：0.03 → 0.04 m/次。
+            # 约 7Hz 实测循环下，平移指令上限约为 0.28m/s；Desk 的 SLS-C 等
+            # 安全规则仍可施加更低上限，不在这里绕过。
+            compliance:
+              max_step: 0.04
+            # Robotiq 夹爪走 USB-RS485 + Modbus RTU；用 by-id 稳定路径（D-009）
+            gripper_type: robotiq
+            gripper_connection: /dev/serial/by-id/usb-FTDI_USB_TO_RS-485_DAASNCGD-if00-port0
+            # 相机：ZED 2i（工作台固定视角）+ ZED-M（腕部视角）的 UVC 裸流，
+            # 经 rlinf_ext 的 zed_uvc 后端采集，不需要 ZED SDK、不需要 NVIDIA GPU
+            # （D-014 / E-004 / A-011）
+            # ⚠️ 两台都必须接在 USB 3.0 口上。ZED 的 UVC 视频端走 SuperSpeed 线对、
+            #    HID 端走 USB 2.0 线对，在系统里呈现为两个独立 USB 设备；接在
+            #    USB 2.0-only 路径（含 USB 2.0 hub）上时 SuperSpeed 协商不了，
+            #    视频端根本不会枚举 —— 这就是 ZED-M 起初只出现 HID 的原因（A-011）。
+            camera_serials:
+              - "usb-Technologies__Inc._ZED_2i_OV0001-video-index0"
+              - "usb-Technologies__Inc._ZED-M-video-index0"
+            camera_type: zed_uvc
+            # zed_uvc 是 out-of-tree 后端，只在 Worker 进程里通过 RLINF_EXT_MODULE 注册
+            # （见 RLinf AGENTS.md "Registration is per process"）。而节点硬件校验发生在
+            # _RemoteNodeProbe 这个独立 Ray actor 里，它不加载扩展模块，因此看不到 zed_uvc，
+            # 会在 Cluster 初始化阶段直接抛 Unsupported BaseCamera backend 'zed_uvc'。
+            # RLinf 为此提供了官方开关 disable_validate（registry.py 的枚举阶段会跳过
+            # validate）。关掉的只是"相机是否插着"这一个探测；配置里的 camera_serials 已显式
+            # 给出，且 FrankaEnv 构造时仍会真正打开相机并在失败时报错，安全网没有消失。
+            disable_validate: true
+
+runner:
+  task_type: embodied
+  logger:
+    log_path: null
+    project_name: rlinf
+    experiment_name: "franka-pico-single-arm"
+    logger_backends: ["tensorboard"]
+  num_data_episodes: 20
+  record_task_description: False
+
+env:
+  group_name: "EnvGroup"
+  eval:
+    teleop: pico
+    no_gripper: False
+    main_image_key: global
+    # 外层硬兜底 = 6 分钟 @10Hz，从 env reset 开始计时。RealWorldEnv 会在此处
+    # 强制写回 truncation；它必须比下方 start_end_timeout 的 3000 步录制期
+    # 看门狗长，才能让正常的「按 a 后连续录制」由看门狗先收尾。
+    # ⚠️ 若按 a 前空等超过 60 秒，外层兜底仍可能先触发；这不是成功 episode。
+    max_episode_steps: 3600
+    # 键盘 episode 控制（D-021 / T-005）。键位以源码为准 —— ⚠️ 官方双臂 Pico 配置
+    # 第 67-70 行的注释描述的是 single_stage，与 start_end 语义不符（A-009）：
+    #   a = 开始录制；录制中再按一次 = 中止（丢弃缓冲，机械臂不动，不改 reward）
+    #   b = 分段（segment_advance，独立 1.0s 防抖）
+    #   c = 成功结束（reward=1.0，terminated=True）
+    # start_end_timeout 是 rlinf_ext 在官方 start_end 之上注册的扩展模式，只多一件事：
+    # 录制步数达到 3000（从 a 开始计数，5 分钟 @10Hz）就强制收尾，防操作者忘记
+    # 按 c。超时的 episode 不给成功奖励（不进 demos/，也不计入 num_data_episodes），
+    # 但仍落 collected_data/*.pkl。
+    # ⚠️ 需要 RLINF_KEYBOARD_DEVICE 钉住真键盘：本机有 2 台键盘类设备
+    #    （Dell KB216 + BRLTTY 虚拟键盘），不钉会直接抛 RuntimeError（RS-007 / E-019）。
+    keyboard_reward_wrapper: "start_end_timeout"
+    video_cfg:
+      save_video: False
+      info_on_video: False
+      video_base_dir: ${runner.logger.log_path}/video/train
+
+    pico:
+      # 同机部署用 IPC；发布端在别的机器时改成 tcp://<ip>:<port>
+      zmq_addr: "ipc:///tmp/vr_data.ipc"
+      hand: "right"
+      # 手柄位移/转动到机械臂的缩放：越大越跟手，越小越稳。1.0 即 1:1。
+      # 2026-10-14 操作者已拉到 1:1。这两项只改「手移动多少 → 下发多少指令」，
+      # 不改速度上限：平移上限由 franky 的 max_step=0.03 m 卡在 0.3 m/s，
+      # 旋转上限由 max_step_rad=0.10 卡在 57°/s。想更稳就往 0.5 调。
+      position_scale: 1.0
+      rotation_scale: 1.0
+      control_trigger: "grip"
+      control_threshold: 0.9
+      gripper_close_button: "A"
+      gripper_open_button: "B"
+      calibration:
+        button: "trigger"
+
+    override_cfg:
+      is_dummy: false
+      task_description: "franka single-arm pico teleoperation demo collection"
+      # 与 env.eval.max_episode_steps 保持一致（看门狗阈值同源）
+      max_num_steps: 3000
+
+      # FrankaEnvConfig 默认 enable_camera_player=True，会起一个线程调 cv2.imshow
+      # 开预览窗口。本机没有可用显示，该线程会抛 OpenCV highgui 未实现的异常
+      # （不致命但刷日志）。无显示器机器上按官方模板同样设 false。
+      enable_camera_player: false
+
+      # 相机命名。名字只用于挑主视角（env.eval.main_image_key）：选中的进
+      # observations["main_images"]，其余按名字排序打包进 extra_view_images。
+      # ZED 2i = 工作台固定视角（主图），ZED-M = 腕部视角（第二视角）。
+      # ⚠️ 落进 LeRobot 时第二视角叫 extra_view_image（不是 wrist_image ——
+      #    LeRobotFrame 只在 observation 带 wrist_images 时才用那个名字，
+      #    而 real env 的 _wrap_obs 统一产出 extra_view_images）。
+      camera_names:
+        "usb-Technologies__Inc._ZED_2i_OV0001-video-index0": global
+        "usb-Technologies__Inc._ZED-M-video-index0": wrist
+
+      # 每步动作上限 [平移(m), 旋转(rad), 夹爪]。
+      # 平移 0.04/步；实际控制循环约 7Hz 时理论上限约 0.28m/s。
+      # 旋转仍由 Franky max_step_rad=0.10rad/次限幅（约57°/s @10Hz）。
+      # 2026-10-13：平移由 0.02 提到 0.03 —— 配合 position_scale 0.4→0.7，
+      # 让"手快速移动时机械臂不掉队"（原 0.02 时手速超过约 0.5 m/s 就会跟丢）。
+      # ⚠️ Franky 的 move_tcp_pose 另有 hardware.compliance.max_step / max_step_rad
+      #    限幅。平移 action_scale[0] 必须不大于并同步调整 max_step；该字段走
+      #    CartesianCompliance.from_config，不走 reconfigure_compliance_params，故只能
+      #    在 cluster...hardware.configs 的 compliance 段设置，不能放 env compliance_param。
+      # 注意 realworld_franka_sft_env 的默认值是 [1.0, 1.0, 1.0]，
+      # 那是给策略的绝对动作用的，直接拿来跑遥操作会一步飞出 1 米。
+      action_scale: [0.04, 0.3, 1.0]
+
+      # 笛卡尔阻抗控制器的权限。franky 的 error_clip 语义是 "largest error acted on"，
+      # 即 tau = K * clamp(误差, ±clip)，是**硬上限**。
+      # 默认走 franky.default_compliance()：K_r=50 Nm/rad、rotational_clip=0.04 rad
+      # → 最大力矩只有 2 Nm；而摆动手腕 + Robotiq 夹爪要克服约 1~2 Nm 重力力矩
+      # 加腕部关节摩擦，于是表现为"平移跟手、旋转迟钝"（A-006 / 文档 7.26）。
+      # 这里把旋转权限提到 80 × 0.15 = 12 Nm（提高 6 倍）。
+      # T-04（2026-10-15，操作者批准）：K_t 受硬件 cap 限制为 1200 N/m；
+      # 将三轴最大受控误差统一到 0.020m，使最大纠偏力约为 24N。
+      # 不改 K_t、速度、旋转或 Desk 安全规则；仅限空载小范围验证，异常即回退。
+      # T-05（2026-10-15，操作者批准）：K_r 受硬件 cap 限制为 80 Nm/rad；
+      # 将旋转最大受控误差从 0.150 提至 0.200rad，使最大纠偏力矩约 12→16Nm。
+      # 不改平移、目标角速度或 Desk 安全规则；仅限空载小角度验证，异常即回退。
+      # 上限参考：rotational_stiffness_cap=80，rotational_clip_floor=0.02。
+      compliance_param:
+        translational_clip_x: 0.02
+        translational_clip_neg_x: 0.02
+        translational_clip_y: 0.02
+        translational_clip_neg_y: 0.02
+        translational_clip_z: 0.02
+        translational_clip_neg_z: 0.02
+        rotational_stiffness: 80.0
+        rotational_clip_x: 0.20
+        rotational_clip_y: 0.20
+        rotational_clip_z: 0.20
+
+      # 复位点 = 2026-10-13 实测 TCP 位姿，启动时不产生任何运动。
+      # 采集正式开始前应改成工作区正上方的安全悬停位。
+      reset_ee_pose: [0.501392, -0.005329, 0.221982, -3.120118, 0.014668, -0.003071]
+      # 目标位姿：FrankaEnv 用它做两件事——
+      #   1) 位置：_calc_step_reward 的成功判定窗口中心
+      #   2) 姿态 [3:]：clip_euler_to_target_window 的旋转窗口中心（必须保留，别乱改）
+      # 探索阶段把位置挪到安全盒之外（z=0.90 > 盒上限 0.60），使 reward 恒为 0、
+      # 不再"碰到某个点就判成功并自动复位"。姿态部分保持不变。
+      target_ee_pose: [0.5236, 0.0888, 0.90, -3.0452, -0.0413, 0.0338]
+
+      # 工作区安全盒 [x, y, z, rx, ry, rz]。
+      # 2026-10-13 按操作者要求放宽（原 x/y ±10cm、z 下 5cm 太小，末端降不下去）。
+      # 注意 z 下限 0.03 的前提假设：机械臂基座与桌面齐平，即基座系 z=0 就是桌面。
+      # 若实际是"基座装在垫高台上"，0.03 会低于桌面。首次下沉时应目视确认，
+      # 然后把 z 下限改成实测的"贴桌面位置 + 1cm"。
+      # 姿态窗口 ±0.5rad（滚转/俯仰）、±0.6rad（偏航），尺寸不变，但**以复位姿态为中心**
+      # （即 reset_ee_pose[3:]）。原窗口是以旧的 target_ee_pose[3:] 为中心的，导致复位点
+      # 到上沿只剩 rz 约 10.7° —— 一转手腕就撞窗，看起来也像"转不动"（A-006 / 7.26）。
+      # clip_euler_to_target_window 的有效区间就是 [min, max] 本身（target 只参与 ±π
+      # 环绕计算），所以平移这两个值即可重新居中，不需要放宽窗口尺寸。
+      ee_pose_limit_min: [-2.000000, -2.000000, -2.000000, -5.120118, -1.985332, -2.003071]
+      ee_pose_limit_max: [2.000000, 2.000000, 2.000000, -1.120118, 2.014668, 1.996929]
+
+      reward_threshold: [0.02, 0.02, 0.02, 0.2, 0.2, 0.2]
+      # 遥操作采集关掉夹爪惩罚，避免人为操作被扣分
+      enable_gripper_penalty: false
+
+    data_collection:
+      enabled: True
+      save_dir: ${runner.logger.log_path}/collected_data
+      export_format: "pickle"
+      # 人类演示全部保留；成功判定在这里没有意义
+      only_success: False
+      robot_type: "panda"
+      fps: 10
