@@ -183,7 +183,7 @@ env:
         # rotational damping candidate. The Franky 2.x tracker receives
         # [D_t, D_t, D_t, D_r, D_r, D_r].
         translational_stiffness: 1200.0
-        translational_damping: 69.282032
+        translational_damping: 50.0
         rotational_damping: 4.0
         translational_clip_x: 0.02
         translational_clip_neg_x: 0.02
@@ -192,9 +192,9 @@ env:
         translational_clip_z: 0.02
         translational_clip_neg_z: 0.02
         rotational_stiffness: 40.0
-        rotational_clip_x: 0.15
-        rotational_clip_y: 0.15
-        rotational_clip_z: 0.15
+        rotational_clip_x: 0.2
+        rotational_clip_y: 0.2
+        rotational_clip_z: 0.2
 
       # 复位点 = 实测 TCP 位姿；启动采集时机械臂会插值移动到它。
       # ⚠️ 它的姿态 [3:] 必须与 target_ee_pose[3:] 处在同一个 ±π 分支：
@@ -222,14 +222,19 @@ env:
       # target_ee_pose[3:] 同处一个 ±π 分支，否则会被恒定夹断（见上方 reset_ee_pose
       # 注释与 A-012）。恢复 2026-10-16 13:41 会话前的已验证值：rx 中心 -3.050868，
       # 三轴 delta 窗口均在 [-π, π) 内可达。
-      ee_pose_limit_min: [-2.000000, -2.000000, -2.000000, -5.050868, -2.001434, -1.730379]
-      ee_pose_limit_max: [2.000000, 2.000000, 2.000000, -1.050868, 1.998566, 2.269621]
+      ee_pose_limit_min: [-3.000000, -3.000000, -3.000000, -5.050868, -2.001434, -1.730379]
+      ee_pose_limit_max: [3.000000, 3.000000, 3.000000, -1.050868, 1.998566, 2.269621]
 
       reward_threshold: [0.02, 0.02, 0.02, 0.2, 0.2, 0.2]
       # 遥操作采集关掉夹爪惩罚，避免人为操作被扣分
       enable_gripper_penalty: false
       continuous_gripper: true
       continuous_gripper_epsilon_m: 0.0001
+      # Every reset closes before arm motion and opens afterward. The completed
+      # opening is the visible signal that the next operator input is accepted.
+      # This intentionally releases any held object.
+      reset_gripper_signal: true
+      reset_gripper_open_timeout_s: 3.0
 
     data_collection:
       enabled: True

@@ -44,6 +44,11 @@ A and X are edge-debounced for 40 ms before their 150 ms combination window.
 During reset, VR motion and recording requests are ignored. Completion leaves VR
 enabled but requires a fresh right-grip press. A and B otherwise remain reserved
 for future DAgger control and have no single-button action.
+
+Every reset, including reset after Y success and A+X discard/reset, closes the
+Robotiq before arm motion and opens it after the arm reaches `reset_ee_pose`.
+The completed opening is the reset-complete signal. Reset intentionally releases
+any object held by the gripper; do not use it when releasing the object is unsafe.
 Do not connect another control process to the robot during a session. Keyboard
 episode controls are not part of the supported collection workflow. Any
 unexpected motion, vibration, force, Desk warning, or robot error requires

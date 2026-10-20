@@ -763,6 +763,43 @@ def test_franka_continuous_gripper_maps_open_close_and_deduplicates_targets():
     ]
 
 
+def test_franka_reset_signals_completion_by_opening_the_gripper(monkeypatch):
+    from rlinf.envs.real.franka.base import FrankaEnv
+
+    env = FrankaEnv.__new__(FrankaEnv)
+    calls = []
+    env.config = SimpleNamespace(
+        reset_gripper_signal=True,
+        reset_gripper_open_timeout_s=0.1,
+        enable_random_reset=False,
+        step_frequency=30.0,
+    )
+
+    class Gripper:
+        max_width = 0.085
+        position = 0.085
+        is_hand = False
+
+        def close(self):
+            calls.append("close")
+
+        def open(self):
+            calls.append("open")
+
+    env._end_effector = Gripper()
+    env._logger = SimpleNamespace(info=lambda *args: None)
+    env._last_continuous_gripper_target = None
+    env._read_robot = lambda: SimpleNamespace(
+        tcp_pose=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    )
+    env._reset_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+
+    env.go_to_rest()
+
+    assert calls == ["close", "open"]
+    assert env._last_continuous_gripper_target == pytest.approx(0.085)
+
+
 def test_franka_binary_gripper_still_uses_its_existing_sign_contract():
     env = FrankaEnv.__new__(FrankaEnv)
     env.config = SimpleNamespace(
