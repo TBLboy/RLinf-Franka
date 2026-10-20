@@ -3075,6 +3075,15 @@ def test_vr_button_edges_captured_before_environment_read_are_not_lost(monkeypat
     assert reader.get_reading()["control_event"] == "record_success"
 
 
+def test_reset_discards_button_edges_captured_while_the_arm_was_resetting():
+    reader = _pico_reader(vr_control={"enabled": True})
+    reader._control_events.extend(("record_start", "record_success"))
+
+    reader.discard_control_events()
+
+    assert not reader._control_events
+
+
 def test_right_axis_click_recalibrates_without_trigger_recalibrating():
     reader = _pico_reader(
         calibration={

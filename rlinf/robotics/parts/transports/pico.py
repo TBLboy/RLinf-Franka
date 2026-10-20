@@ -480,6 +480,12 @@ class PicoExpert:
         self._ref_controller_pos = None
         self._ref_controller_rot = None
 
+    def discard_control_events(self) -> None:
+        """Drop button edges captured while a blocking robot reset ran."""
+        with self._lock:
+            self._control_events.clear()
+            self._pending_ax.clear()
+
     def _motion_since_hold(
         self,
         controller_pos: np.ndarray,

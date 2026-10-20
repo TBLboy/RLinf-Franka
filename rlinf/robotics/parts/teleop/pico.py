@@ -276,6 +276,7 @@ class Pico(TeleopDevice):
         """Clear the pose anchor from the previous episode."""
         self._held_from = None
         self._last_continuous_gripper_action = None
+        self._device.discard_control_events()
 
 
 class PicoDelta(Pico):
