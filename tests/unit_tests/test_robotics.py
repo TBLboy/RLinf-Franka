@@ -3096,6 +3096,24 @@ def test_reset_discards_button_edges_captured_while_the_arm_was_resetting():
     reader = _pico_reader(vr_control={"enabled": True})
     reader._control_events.extend(("record_start", "record_success"))
 
+    reader.discard_control_events(keep_record_start=True)
+
+    assert list(reader._control_events) == ["record_start"]
+
+
+def test_reset_discards_all_events_when_no_next_recording_is_requested():
+    reader = _pico_reader(vr_control={"enabled": True})
+    reader._control_events.extend(("record_success", "record_discard", "robot_reset"))
+
+    reader.discard_control_events(keep_record_start=True)
+
+    assert not reader._control_events
+
+
+def test_before_reset_discards_preexisting_pico_events():
+    reader = _pico_reader(vr_control={"enabled": True})
+    reader._control_events.append("record_start")
+
     reader.discard_control_events()
 
     assert not reader._control_events

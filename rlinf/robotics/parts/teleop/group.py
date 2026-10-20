@@ -177,6 +177,13 @@ class TeleopGroup:
         for entry in self.entries:
             entry.device.on_reset(context)
 
+    def before_reset(self) -> None:
+        """Let devices discard input that predates a blocking robot reset."""
+        for device in self.devices:
+            prepare = getattr(device, "before_reset", None)
+            if callable(prepare):
+                prepare()
+
     def action(
         self, context: Mapping[str, Any]
     ) -> tuple[dict[str, np.ndarray], bool, dict[str, Any]]:

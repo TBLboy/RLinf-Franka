@@ -276,6 +276,13 @@ class Pico(TeleopDevice):
         """Clear the pose anchor from the previous episode."""
         self._held_from = None
         self._last_continuous_gripper_action = None
+        # Reset is synchronous, so the receiver can see a left-stick press
+        # while the arm is returning home. Preserve that one request for the
+        # first ready step; all motion and terminal events remain stale.
+        self._device.discard_control_events(keep_record_start=True)
+
+    def before_reset(self) -> None:
+        """Discard input that arrived before a blocking robot reset began."""
         self._device.discard_control_events()
 
 

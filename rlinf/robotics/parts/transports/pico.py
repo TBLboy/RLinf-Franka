@@ -481,10 +481,15 @@ class PicoExpert:
         self._ref_controller_pos = None
         self._ref_controller_rot = None
 
-    def discard_control_events(self) -> None:
-        """Drop button edges captured while a blocking robot reset ran."""
+    def discard_control_events(self, *, keep_record_start: bool = False) -> None:
+        """Drop stale button edges, optionally retaining the next recording request."""
         with self._lock:
-            self._control_events.clear()
+            if keep_record_start:
+                self._control_events = deque(
+                    event for event in self._control_events if event == "record_start"
+                )
+            else:
+                self._control_events.clear()
             self._pending_ax.clear()
 
     def _motion_since_hold(

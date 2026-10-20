@@ -91,6 +91,7 @@ class ComposedTeleop(TeleopDevice):
 
     def before_reset(self, env: gym.Env, kwargs: dict[str, Any]) -> dict[str, Any]:
         """Pause the streamer and allow it to adjust reset arguments."""
+        self.group.before_reset()
         if self.streamer is not None:
             return self.streamer.before_reset(env, kwargs)
         return kwargs
