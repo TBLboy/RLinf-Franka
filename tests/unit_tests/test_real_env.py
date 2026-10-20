@@ -829,6 +829,23 @@ def test_franka_first_environment_reset_skips_the_gripper_signal():
     assert env._has_completed_first_reset is True
 
 
+def test_franka_camera_infos_use_the_configured_frame_rate():
+    from rlinf.envs.real.franka.base import FrankaEnv
+
+    env = FrankaEnv.__new__(FrankaEnv)
+    env.hardware = SimpleNamespace(camera_serials=["cam-a", "cam-b"], camera_type="zed_uvc")
+    env.config = SimpleNamespace(
+        camera_names={"cam-a": "global", "cam-b": "wrist"},
+        camera_crop_regions=None,
+        camera_fps=30,
+        enable_camera_depth=False,
+    )
+
+    infos = env._build_camera_infos()
+
+    assert [(info.name, info.fps) for info in infos] == [("global", 30), ("wrist", 30)]
+
+
 def test_franka_binary_gripper_still_uses_its_existing_sign_contract():
     env = FrankaEnv.__new__(FrankaEnv)
     env.config = SimpleNamespace(

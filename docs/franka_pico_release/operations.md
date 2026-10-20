@@ -24,6 +24,11 @@ workspace; stop immediately for stale motion, vibration, unexpected force,
 Desk warnings, or errors. The 10 Hz baseline is tagged locally as
 `backup/vr-controls-20261020`.
 
+Both UVC cameras are explicitly requested at 30 FPS. A session rejects a camera
+that cannot report the configured resolution and frame rate; do not treat 30 Hz
+images as valid until an operator confirms two fresh, stable camera streams on
+direct USB 3.0 connections.
+
 ## Pico operator controls
 
 The supported single-arm collection controls are:

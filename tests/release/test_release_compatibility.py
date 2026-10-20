@@ -69,3 +69,4 @@ def test_release_config_keeps_control_and_dataset_rate_aligned() -> None:
     ).read_text()
     assert "step_frequency: 30.0" in config
     assert "fps: 30" in config
+    assert "camera_fps: 30" in config

@@ -147,6 +147,10 @@ env:
       camera_names:
         "usb-Technologies__Inc._ZED_2i_OV0001-video-index0": global
         "usb-Technologies__Inc._ZED-M-video-index0": wrist
+      # Match camera production to the 30 Hz control/data cadence. Both cameras
+      # must stay on direct USB 3.0 paths; validate fresh frames before using
+      # the resulting data for training.
+      camera_fps: 30
 
       # 每步动作上限 [平移(m), 旋转(rad), 夹爪]。
       # 平移 0.04/步；实际控制循环约 7Hz 时理论上限约 0.28m/s。

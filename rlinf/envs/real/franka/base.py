@@ -98,6 +98,7 @@ class FrankaEnvConfig:
     """Task, control, and observation settings for a Franka environment."""
 
     camera_names: Optional[dict[str, str]] = None
+    camera_fps: int = 15
     enable_camera_player: bool = True
     # Per-camera [top, left, bottom, right] crop fractions, keyed by serial.
     camera_crop_regions: Optional[dict[str, list[float]]] = None
@@ -810,6 +811,7 @@ class FrankaEnv(gym.Env):
                     name=name,
                     serial_number=serial,
                     camera_type=default_camera_type,
+                    fps=self.config.camera_fps,
                     crop_region=crop_region,
                     enable_depth=self.config.enable_camera_depth,
                 )

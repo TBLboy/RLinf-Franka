@@ -112,11 +112,17 @@ class ZEDUVCCamera(BaseCamera):
 
         actual_w = int(capture.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_h = int(capture.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        actual_fps = float(capture.get(cv2.CAP_PROP_FPS))
         if (actual_w, actual_h) != (self.CAPTURE_WIDTH, self.CAPTURE_HEIGHT):
             raise RuntimeError(
                 f"ZED UVC camera (serial={info.serial_number}, dev_path={dev_path}) "
                 f"returned {actual_w}x{actual_h}; expected "
                 f"{self.CAPTURE_WIDTH}x{self.CAPTURE_HEIGHT}."
+            )
+        if abs(actual_fps - info.fps) > 1.0:
+            raise RuntimeError(
+                f"ZED UVC camera (serial={info.serial_number}, dev_path={dev_path}) "
+                f"returned {actual_fps:.1f} FPS; expected {info.fps} FPS."
             )
 
         # The camera resets auto-exposure on open and the first frames come
