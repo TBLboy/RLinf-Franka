@@ -409,10 +409,11 @@ class PicoExpert:
             elif not pressed:
                 self._button_down_at.pop(name, None)
                 self._button_accepted.discard(name)
+            required_hold = self.button_debounce_s if name in ("A", "X") else 0.0
             if (
                 pressed
                 and name not in self._button_accepted
-                and now - self._button_down_at.get(name, now) >= self.button_debounce_s
+                and now - self._button_down_at.get(name, now) >= required_hold
             ):
                 self._button_accepted.add(name)
                 if name in ("A", "X"):

@@ -142,7 +142,6 @@ class FrankaEnvConfig:
     continuous_gripper: bool = False
     continuous_gripper_epsilon_m: float = 1e-4
     reset_gripper_signal: bool = False
-    reset_gripper_open_timeout_s: float = 3.0
     enable_gripper_penalty: bool = True
     gripper_penalty: float = 0.1
     save_video_path: Optional[str] = None
@@ -600,18 +599,24 @@ class FrankaEnv(gym.Env):
             reset_pose = self._reset_pose.copy()
 
         self._franka_state = self._read_robot()
-        cnt = 0
-        while not np.allclose(self._franka_state.tcp_pose[:3], reset_pose[:3], 0.02):
-            cnt += 1
+        if use_reset_gripper_signal:
+            # One bounded trajectory is enough for the operator reset flow.
+            # Do not add position-convergence retries before the open signal.
             self._interpolate_move(reset_pose)
             self._franka_state = self._read_robot()
-            if cnt > 2:
-                break
+        else:
+            cnt = 0
+            while not np.allclose(self._franka_state.tcp_pose[:3], reset_pose[:3], 0.02):
+                cnt += 1
+                self._interpolate_move(reset_pose)
+                self._franka_state = self._read_robot()
+                if cnt > 2:
+                    break
 
         if use_reset_gripper_signal:
             self._logger.info("Reset signal: opening gripper after arm motion.")
             self._end_effector.open()
-            self._wait_for_reset_gripper_open()
+            self._last_continuous_gripper_target = self._end_effector.max_width
 
         # Reset dexterous hands; individual tasks remain responsible for grippers.
         if self._is_hand:
@@ -620,21 +625,6 @@ class FrankaEnv(gym.Env):
                 np.array(self.config.hand_reset_state, dtype=np.float64)
                 * self.config.hand_action_scale
             )
-
-    def _wait_for_reset_gripper_open(self) -> None:
-        """Wait for the reset-complete gripper-open signal or fail safely."""
-        deadline = time.monotonic() + self.config.reset_gripper_open_timeout_s
-        target = self._end_effector.max_width
-        tolerance = min(0.005, target * 0.1)
-        while time.monotonic() < deadline:
-            if self._end_effector.position >= target - tolerance:
-                self._last_continuous_gripper_target = target
-                return
-            time.sleep(0.05)
-        raise RuntimeError(
-            "Reset gripper did not open before the configured timeout; "
-            "do not continue teleoperation."
-        )
 
     @property
     def _ee_interface(self) -> EndEffector | type[EndEffector]:

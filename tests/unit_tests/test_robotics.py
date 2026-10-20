@@ -3075,6 +3075,23 @@ def test_vr_button_edges_captured_before_environment_read_are_not_lost(monkeypat
     assert reader.get_reading()["control_event"] == "record_success"
 
 
+def test_vr_record_start_accepts_a_single_packet_edge(monkeypatch):
+    import rlinf.robotics.parts.transports.pico as pico_transport
+
+    monkeypatch.setattr(pico_transport.time, "monotonic", lambda: 0.0)
+    reader = _pico_reader(vr_control={"enabled": True, "button_debounce_s": 0.04})
+    reader._vr_enabled = True
+    reader._await_grip_release = False
+    reader._running = True
+
+    reader._update_vr_controls(
+        _pico_packet(0, 0, 0, 0, grip=0, buttons={"left_axis_click": True})
+    )
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0)
+
+    assert reader.get_reading()["control_event"] == "record_start"
+
+
 def test_reset_discards_button_edges_captured_while_the_arm_was_resetting():
     reader = _pico_reader(vr_control={"enabled": True})
     reader._control_events.extend(("record_start", "record_success"))

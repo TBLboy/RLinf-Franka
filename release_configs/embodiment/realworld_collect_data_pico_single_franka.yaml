@@ -230,11 +230,10 @@ env:
       enable_gripper_penalty: false
       continuous_gripper: true
       continuous_gripper_epsilon_m: 0.0001
-      # Every reset closes before arm motion and opens afterward. The completed
-      # opening is the visible signal that the next operator input is accepted.
+      # Every post-startup reset closes before arm motion and opens after one
+      # bounded reset trajectory. Opening is the visible reset-complete signal.
       # This intentionally releases any held object.
       reset_gripper_signal: true
-      reset_gripper_open_timeout_s: 3.0
 
     data_collection:
       enabled: True

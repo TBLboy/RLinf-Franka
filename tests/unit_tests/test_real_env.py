@@ -770,7 +770,6 @@ def test_franka_reset_signals_completion_by_opening_the_gripper(monkeypatch):
     calls = []
     env.config = SimpleNamespace(
         reset_gripper_signal=True,
-        reset_gripper_open_timeout_s=0.1,
         enable_random_reset=False,
         step_frequency=30.0,
     )
@@ -793,10 +792,11 @@ def test_franka_reset_signals_completion_by_opening_the_gripper(monkeypatch):
         tcp_pose=np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
     )
     env._reset_pose = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0])
+    env._interpolate_move = lambda pose: calls.append("move")
 
     env.go_to_rest()
 
-    assert calls == ["close", "open"]
+    assert calls == ["close", "move", "open"]
     assert env._last_continuous_gripper_target == pytest.approx(0.085)
 
 
