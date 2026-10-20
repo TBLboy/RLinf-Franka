@@ -3864,6 +3864,9 @@ def test_a_real_arm_runs_against_a_faked_sdk():
 
         observation = arm.get_observation()
         assert observation["tcp_pose"].shape == (7,)
+        assert observation["arm_joint_position"].shape == (7,)
+        assert observation["arm_joint_velocity"].shape == (7,)
+        assert observation["arm_joint_torque"].shape == (7,)
 
         arm.send_action({"joint_position": [0.0] * 7})
 

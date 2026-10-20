@@ -97,6 +97,7 @@ def franky() -> types.ModuleType:
                 O_T_EE=Affine(),
                 q=np.asarray(HOME_JOINTS, dtype=np.float64),
                 dq=np.zeros(7),
+                tau_J=np.zeros(7),
                 # Wrench in the stiffness frame, which is what the arm reads.
                 K_F_ext_hat_K=np.zeros(6),
                 O_F_ext_hat_K=np.zeros(6),

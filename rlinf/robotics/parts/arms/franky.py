@@ -292,6 +292,7 @@ class FrankyArm(BaseArm):
         )
         joint_pos = np.asarray(raw.q, dtype=np.float64)
         joint_vel = np.asarray(raw.dq, dtype=np.float64)
+        joint_torque = np.asarray(raw.tau_J, dtype=np.float64)
         K_F_ext = np.asarray(raw.K_F_ext_hat_K, dtype=np.float64)
         jacobian = np.asarray(
             self._robot.model.zero_jacobian(self._franky.Frame.EndEffector, raw),
@@ -302,6 +303,7 @@ class FrankyArm(BaseArm):
         s.tcp_pose = tcp_pose
         s.arm_joint_position = joint_pos
         s.arm_joint_velocity = joint_vel
+        s.arm_joint_torque = joint_torque
         s.tcp_force = K_F_ext[:3]
         s.tcp_torque = K_F_ext[3:]
         s.arm_jacobian = jacobian

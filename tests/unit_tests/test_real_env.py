@@ -846,6 +846,29 @@ def test_franka_camera_infos_use_the_configured_frame_rate():
     assert [(info.name, info.fps) for info in infos] == [("global", 30), ("wrist", 30)]
 
 
+def test_franka_observation_keeps_measured_joint_states():
+    from rlinf.envs.real.franka.base import FrankaEnv
+    from rlinf.robotics.parts.arms.franka import FrankaRobotState
+
+    env = FrankaEnv.__new__(FrankaEnv)
+    env.config = SimpleNamespace(is_dummy=False)
+    env._last_frames = {"global": np.zeros((128, 128, 3), dtype=np.uint8)}
+    env._last_depths = {}
+    env._franka_state = FrankaRobotState(
+        arm_joint_position=np.arange(7, dtype=float),
+        arm_joint_velocity=np.arange(7, dtype=float) + 10,
+        arm_joint_torque=np.arange(7, dtype=float) + 20,
+    )
+    env._end_effector = SimpleNamespace(is_hand=False, state_dim=1)
+
+    observation = env._get_observation()
+
+    state = observation["state"]
+    assert state["arm_joint_position"] == pytest.approx(np.arange(7))
+    assert state["arm_joint_velocity"] == pytest.approx(np.arange(7) + 10)
+    assert state["arm_joint_torque"] == pytest.approx(np.arange(7) + 20)
+
+
 def test_franka_binary_gripper_still_uses_its_existing_sign_contract():
     env = FrankaEnv.__new__(FrankaEnv)
     env.config = SimpleNamespace(

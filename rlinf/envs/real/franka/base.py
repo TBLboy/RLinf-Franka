@@ -708,6 +708,15 @@ class FrankaEnv(gym.Env):
                             -np.inf, np.inf, shape=(obs_tcp_pose_dim,)
                         ),
                         "tcp_vel": gym.spaces.Box(-np.inf, np.inf, shape=(6,)),
+                        "arm_joint_position": gym.spaces.Box(
+                            -np.inf, np.inf, shape=(7,)
+                        ),
+                        "arm_joint_velocity": gym.spaces.Box(
+                            -np.inf, np.inf, shape=(7,)
+                        ),
+                        "arm_joint_torque": gym.spaces.Box(
+                            -np.inf, np.inf, shape=(7,)
+                        ),
                         ee_state_key: gym.spaces.Box(
                             ee_low, ee_high, shape=(self._ee_interface.state_dim,)
                         ),
@@ -1067,6 +1076,9 @@ class FrankaEnv(gym.Env):
                 "tcp_vel": self._franka_state.tcp_vel,
                 "tcp_force": self._franka_state.tcp_force,
                 "tcp_torque": self._franka_state.tcp_torque,
+                "arm_joint_position": self._franka_state.arm_joint_position,
+                "arm_joint_velocity": self._franka_state.arm_joint_velocity,
+                "arm_joint_torque": self._franka_state.arm_joint_torque,
             }
             # Use the state field declared in observation_space.
             if self._is_hand:

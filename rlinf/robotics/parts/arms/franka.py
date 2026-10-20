@@ -48,6 +48,9 @@ class FrankaRobotState:
     arm_joint_velocity: np.ndarray = field(
         default_factory=lambda: np.zeros(7)
     )  # FrankaState.dq
+    arm_joint_torque: np.ndarray = field(
+        default_factory=lambda: np.zeros(7)
+    )  # FrankaState.tau_J
     tcp_force: np.ndarray = field(
         default_factory=lambda: np.zeros(3)
     )  # FrankaState.K_F_ext_hat_K[0:3]

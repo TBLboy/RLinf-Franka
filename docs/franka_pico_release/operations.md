@@ -29,6 +29,14 @@ that cannot report the configured resolution and frame rate; do not treat 30 Hz
 images as valid until an operator confirms two fresh, stable camera streams on
 direct USB 3.0 connections.
 
+## Recorded robot state
+
+Each 30 Hz observation records measured Franka joint position (`q`), joint
+velocity (`dq`), and measured joint torque (`tau_J`), each with seven values.
+The raw pickle retains them inside the observation state; the supported LeRobot
+conversion appends them to its flat `state` vector alongside the existing TCP,
+force, torque, and gripper values.
+
 ## Pico operator controls
 
 The supported single-arm collection controls are:
