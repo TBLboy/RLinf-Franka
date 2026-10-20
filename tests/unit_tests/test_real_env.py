@@ -800,6 +800,35 @@ def test_franka_reset_signals_completion_by_opening_the_gripper(monkeypatch):
     assert env._last_continuous_gripper_target == pytest.approx(0.085)
 
 
+def test_franka_first_environment_reset_skips_the_gripper_signal():
+    from rlinf.envs.real.franka.base import FrankaEnv
+
+    env = FrankaEnv.__new__(FrankaEnv)
+    calls = []
+    env.config = SimpleNamespace(
+        is_dummy=False,
+        reset_gripper_signal=True,
+        compliance_param={},
+        joint_reset_cycle=100,
+    )
+    env._has_completed_first_reset = False
+    env._base_observation_space = None
+    env._joint_reset_cycle = iter((1,))
+    env._success_hold_counter = 0
+    env.go_to_rest = lambda joint_reset, signal_gripper: calls.append(
+        (joint_reset, signal_gripper)
+    )
+    env._arm = SimpleNamespace(reconfigure_compliance_params=lambda params: None)
+    env._clear_error = lambda: None
+    env._read_robot = lambda: None
+    env._get_observation = lambda: {}
+
+    env.reset()
+
+    assert calls == [(False, False)]
+    assert env._has_completed_first_reset is True
+
+
 def test_franka_binary_gripper_still_uses_its_existing_sign_contract():
     env = FrankaEnv.__new__(FrankaEnv)
     env.config = SimpleNamespace(
@@ -1499,7 +1528,9 @@ def test_pico_episode_controls_translate_events_to_collection_boundaries():
 
     class Env(gym.Env):
         def __init__(self):
-            self.events = iter(("record_start", "record_success", "record_discard"))
+            self.events = iter(
+                ("record_start", "record_success", "record_start", "record_discard")
+            )
 
         def reset(self, **kwargs):
             return {}, {}
@@ -1513,16 +1544,23 @@ def test_pico_episode_controls_translate_events_to_collection_boundaries():
     assert (reward, terminated, truncated) == (0.0, False, False)
     assert info["record_reset"] is True
     assert info["pre_record"] is False
+    assert info["pico_event_status"] == "accepted"
 
     _, reward, terminated, truncated, info = wrapper.step(None)
     assert (reward, terminated, truncated) == (1.0, True, False)
     assert info["pre_record"] is False
+    assert info["pico_event_status"] == "accepted"
 
     wrapper.reset()
     _, reward, terminated, truncated, info = wrapper.step(None)
     assert (reward, terminated, truncated) == (0.0, False, False)
-    assert info["record_reset"] is False
+    assert info["record_reset"] is True
+
+    _, reward, terminated, truncated, info = wrapper.step(None)
+    assert (reward, terminated, truncated) == (0.0, True, False)
+    assert info["record_reset"] is True
     assert info["pre_record"] is True
+    assert info["pico_event_status"] == "accepted"
 
 
 def test_episode_wrappers_report_through_the_logger():

@@ -238,6 +238,10 @@ class FrankaEnv(gym.Env):
         self._success_hold_counter = 0
         self._last_hand_command: np.ndarray | None = None
         self._last_continuous_gripper_target: float | None = None
+        # Construction already positions the arm at reset_pose. The first
+        # environment reset only synchronizes state, so it must not repeat the
+        # operator-visible gripper signal reserved for later episode resets.
+        self._has_completed_first_reset = False
         self._reward_worker = None
         self.robot: Robot | None = None
 
@@ -563,7 +567,11 @@ class FrankaEnv(gym.Env):
             )
             joint_reset = True
 
-        self.go_to_rest(joint_reset)
+        self.go_to_rest(
+            joint_reset,
+            signal_gripper=self._has_completed_first_reset,
+        )
+        self._has_completed_first_reset = True
 
         self._clear_error()
         self._num_steps = 0
@@ -572,9 +580,11 @@ class FrankaEnv(gym.Env):
 
         return observation, {}
 
-    def go_to_rest(self, joint_reset: bool = False) -> None:
+    def go_to_rest(
+        self, joint_reset: bool = False, *, signal_gripper: bool = True
+    ) -> None:
         use_reset_gripper_signal = (
-            not self._is_hand and self.config.reset_gripper_signal
+            signal_gripper and not self._is_hand and self.config.reset_gripper_signal
         )
         if use_reset_gripper_signal:
             self._logger.info("Reset signal: closing gripper before arm motion.")

@@ -36,7 +36,7 @@ The supported single-arm collection controls are:
 | Right trigger while grip is held | Set the continuous Robotiq opening target. |
 | Left thumbstick click | Start a recording when VR is enabled and no recording is active. |
 | Y | End and save the active recording successfully. |
-| X | End and discard the active recording. |
+| X | End and discard the active recording, then reset. |
 | A + X within 150 ms | Discard the active recording and run the configured reset pose. |
 | Right thumbstick click | Recalibrate the Pico frame while arm control is inactive. |
 

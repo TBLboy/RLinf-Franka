@@ -100,27 +100,42 @@ class PicoStartEndTimeout(gym.Wrapper):
         obs, reward, terminated, truncated, info = self.env.step(action)
         event = info.get("pico_control_event")
         record_reset = False
+        event_status = None
+        recording_before = self._recording
 
         if event == "record_start" and not self._recording:
             self._recording = True
             record_reset = True
             self._recorded_steps = 0
             self._counting = True
+            event_status = "accepted"
+        elif event == "record_start":
+            event_status = "ignored_already_recording"
         elif event == "record_success" and self._recording:
             reward = 1.0
             terminated = True
             self._counting = False
+            event_status = "accepted"
+        elif event == "record_success":
+            event_status = "ignored_not_recording"
         elif event == "record_discard" and self._recording:
             self._recording = False
             record_reset = True
             self._recorded_steps = 0
             self._counting = False
+            # End the environment episode so its normal reset path returns the
+            # arm home after the discarded buffer has been cleared.
+            terminated = True
+            event_status = "accepted"
+        elif event == "record_discard":
+            event_status = "ignored_not_recording"
         elif event == "robot_reset":
             self._recording = False
             record_reset = True
             self._recorded_steps = 0
             self._counting = False
             terminated = True
+            event_status = "accepted"
 
         if self._counting and not record_reset and not terminated:
             self._recorded_steps += 1
@@ -144,6 +159,16 @@ class PicoStartEndTimeout(gym.Wrapper):
         info["record_reset"] = record_reset
         info["keyboard_phase"] = "rec" if self._recording else "pre"
         info["keyboard_event"] = event
+        if event is not None:
+            info["pico_event_status"] = event_status or "forwarded"
+            info["pico_recording_before"] = recording_before
+            _logger.info(
+                "Pico event=%s status=%s recording=%s record_reset=%s",
+                event,
+                info["pico_event_status"],
+                f"{recording_before}->{self._recording}",
+                record_reset,
+            )
         info["segment_advance"] = False
         return obs, reward, terminated, truncated, info
 

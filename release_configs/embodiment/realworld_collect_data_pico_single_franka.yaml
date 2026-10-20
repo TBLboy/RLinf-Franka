@@ -230,8 +230,9 @@ env:
       enable_gripper_penalty: false
       continuous_gripper: true
       continuous_gripper_epsilon_m: 0.0001
-      # Every post-startup reset closes before arm motion and opens after one
-      # bounded reset trajectory. Opening is the visible reset-complete signal.
+      # The first environment reset after startup keeps ordinary arm-only
+      # positioning. Later episode resets close before arm motion and open
+      # after one bounded reset trajectory; opening is the visible signal.
       # This intentionally releases any held object.
       reset_gripper_signal: true
 
