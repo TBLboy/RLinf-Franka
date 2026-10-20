@@ -10,11 +10,31 @@ bash scripts/run_pico_session.sh
 ```
 
 The collection launcher owns the Ray lifecycle and the Pico publisher lifecycle.
-Do not connect another control process to the robot during a session. During
-recording, `a` starts or aborts, `b` creates a segment, and `c` completes a
-successful episode; hold the Pico grip while operating. Any unexpected motion,
-vibration, force, Desk warning, or robot error requires releasing grip and
-stopping immediately.
+
+## Pico operator controls
+
+The supported single-arm collection controls are:
+
+| Input | Effect |
+| --- | --- |
+| Right menu, release after holding at least 1 second | Enable VR control. Release the right grip once before driving again. |
+| Right menu, release before 1 second | Pause and lock VR control immediately. |
+| Right side grip | Hold to drive Cartesian arm motion. |
+| Right trigger while grip is held | Set the continuous Robotiq opening target. |
+| Left thumbstick click | Start a recording when VR is enabled and no recording is active. |
+| Y | End and save the active recording successfully. |
+| X | End and discard the active recording. |
+| A + X within 150 ms | Discard the active recording and run the configured reset pose. |
+| Right thumbstick click | Recalibrate the Pico frame while arm control is inactive. |
+
+A and X are edge-debounced for 40 ms before their 150 ms combination window.
+During reset, VR motion and recording requests are ignored. Completion leaves VR
+enabled but requires a fresh right-grip press. A and B otherwise remain reserved
+for future DAgger control and have no single-button action.
+Do not connect another control process to the robot during a session. Keyboard
+episode controls are not part of the supported collection workflow. Any
+unexpected motion, vibration, force, Desk warning, or robot error requires
+releasing grip and stopping immediately.
 
 After a completed run:
 

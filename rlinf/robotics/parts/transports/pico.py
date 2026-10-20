@@ -113,6 +113,7 @@ class PicoExpert:
         reconnect_interval_ms: int = 500,
         max_stale_s: float = 0.25,
         calibration: Optional[Mapping[str, Any]] = None,
+        vr_control: Optional[Mapping[str, Any]] = None,
     ) -> None:
         if zmq_config is None:
             zmq_cfg = {}
@@ -190,6 +191,20 @@ class PicoExpert:
         self._calibration_t = np.zeros(3, dtype=np.float64)
         self._prev_calibration_button = False
 
+        vr_control_cfg = dict(vr_control or {})
+        self.vr_control_enabled = bool(vr_control_cfg.get("enabled", False))
+        self.menu_button = str(vr_control_cfg.get("menu_button", "right_menu_button"))
+        self.menu_hold_s = float(vr_control_cfg.get("menu_hold_s", 1.0))
+        self.button_debounce_s = float(vr_control_cfg.get("button_debounce_s", 0.04))
+        self.combo_window_s = float(vr_control_cfg.get("combo_window_s", 0.15))
+        self._vr_enabled = not self.vr_control_enabled
+        self._await_grip_release = self.vr_control_enabled
+        self._menu_down_at: float | None = None
+        self._button_down_at: dict[str, float] = {}
+        self._button_accepted: set[str] = set()
+        self._prev_buttons: dict[str, bool] = {}
+        self._pending_ax: dict[str, float] = {}
+
         self.start()
 
     @property
@@ -262,6 +277,16 @@ class PicoExpert:
             self._deactivate()
             return {**idle, "stale": True}
 
+        control_event = self._update_vr_controls(data)
+        if self.vr_control_enabled and not self._vr_enabled:
+            self._deactivate()
+            return {
+                **idle,
+                "ready": True,
+                "vr_enabled": False,
+                "control_event": control_event,
+            }
+
         self._maybe_update_calibration(data)
         if (
             self.calibration_enabled
@@ -277,6 +302,18 @@ class PicoExpert:
             return {**idle, "ready": True, "invalid_pose": True}
 
         control_value = self._control_value(data, self.hand, self.control_trigger)
+        if self._await_grip_release:
+            if control_value < self.control_threshold:
+                self._await_grip_release = False
+            else:
+                self._deactivate()
+                return {
+                    **idle,
+                    "ready": True,
+                    "calibrated": self._calibrated,
+                    "vr_enabled": self._vr_enabled,
+                    "control_event": control_event,
+                }
         held = control_value >= self.control_threshold
         position, rotation = self._transform_raw_pose_to_world(pose)
 
@@ -292,6 +329,8 @@ class PicoExpert:
             "ready": True,
             "control_value": control_value,
             "calibrated": self._calibrated,
+            "vr_enabled": self._vr_enabled,
+            "control_event": control_event,
         }
         if not held:
             return reading
@@ -327,6 +366,74 @@ class PicoExpert:
             "grip_close": close_pressed,
             "grip_open": open_pressed,
         }
+
+    def _update_vr_controls(self, data: Mapping[str, Any]) -> str | None:
+        """Advance the configured VR control state and return one edge event."""
+        if not self.vr_control_enabled:
+            return None
+
+        now = time.monotonic()
+        buttons = data.get("buttons", {})
+        menu_pressed = bool(buttons.get(self.menu_button, False))
+        previous_menu = self._prev_buttons.get(self.menu_button, False)
+        if menu_pressed and not previous_menu:
+            self._menu_down_at = now
+        elif previous_menu and not menu_pressed and self._menu_down_at is not None:
+            if now - self._menu_down_at >= self.menu_hold_s:
+                self._vr_enabled = True
+                self._await_grip_release = True
+                event = "vr_enabled"
+            else:
+                self._vr_enabled = False
+                self._await_grip_release = True
+                self._deactivate()
+                event = "vr_paused"
+            self._menu_down_at = None
+            self._prev_buttons[self.menu_button] = menu_pressed
+            return event
+        self._prev_buttons[self.menu_button] = menu_pressed
+
+        watched = ("left_axis_click", "Y", "A", "X")
+        for name in watched:
+            pressed = bool(buttons.get(name, False))
+            previous = self._prev_buttons.get(name, False)
+            if pressed and not previous:
+                self._button_down_at[name] = now
+            elif not pressed:
+                self._button_down_at.pop(name, None)
+                self._button_accepted.discard(name)
+            if (
+                pressed
+                and name not in self._button_accepted
+                and now - self._button_down_at.get(name, now) >= self.button_debounce_s
+            ):
+                self._button_accepted.add(name)
+                if name in ("A", "X"):
+                    self._pending_ax[name] = now
+                elif self._vr_enabled:
+                    self._prev_buttons[name] = pressed
+                    return "record_start" if name == "left_axis_click" else "record_success"
+            self._prev_buttons[name] = pressed
+
+        if not self._vr_enabled:
+            self._pending_ax.clear()
+            return None
+        if {"A", "X"} <= self._pending_ax.keys():
+            if abs(self._pending_ax["A"] - self._pending_ax["X"]) <= self.combo_window_s:
+                self._pending_ax.clear()
+                self._await_grip_release = True
+                self._deactivate()
+                return "robot_reset"
+        expired = [
+            name
+            for name, accepted_at in self._pending_ax.items()
+            if now - accepted_at >= self.combo_window_s
+        ]
+        for name in expired:
+            self._pending_ax.pop(name)
+            if name == "X":
+                return "record_discard"
+        return None
 
     def _recv_loop(self) -> None:
         while self._running:

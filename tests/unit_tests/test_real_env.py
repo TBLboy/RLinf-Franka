@@ -1457,6 +1457,37 @@ def test_every_keyboard_wrapper_shares_the_session(monkeypatch):
         assert issubclass(wrapper, KeyboardSession), wrapper.__name__
 
 
+def test_pico_episode_controls_translate_events_to_collection_boundaries():
+    from rlinf_ext.collection import PicoStartEndTimeout
+
+    class Env(gym.Env):
+        def __init__(self):
+            self.events = iter(("record_start", "record_success", "record_discard"))
+
+        def reset(self, **kwargs):
+            return {}, {}
+
+        def step(self, action):
+            return {}, 0.0, False, False, {"pico_control_event": next(self.events)}
+
+    wrapper = PicoStartEndTimeout(Env())
+
+    _, reward, terminated, truncated, info = wrapper.step(None)
+    assert (reward, terminated, truncated) == (0.0, False, False)
+    assert info["record_reset"] is True
+    assert info["pre_record"] is False
+
+    _, reward, terminated, truncated, info = wrapper.step(None)
+    assert (reward, terminated, truncated) == (1.0, True, False)
+    assert info["pre_record"] is False
+
+    wrapper.reset()
+    _, reward, terminated, truncated, info = wrapper.step(None)
+    assert (reward, terminated, truncated) == (0.0, False, False)
+    assert info["record_reset"] is False
+    assert info["pre_record"] is True
+
+
 def test_episode_wrappers_report_through_the_logger():
     episode_dir = _ROOT / "rlinf" / "envs" / "real" / "episode"
     offenders = sorted(

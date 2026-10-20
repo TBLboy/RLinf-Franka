@@ -2896,7 +2896,9 @@ def test_the_arm_anchors_where_it_was_when_the_operator_took_hold():
 # Controller packet reader
 
 
-def _pico_packet(x, y, z, yaw, grip, trigger=0.0, close=False, open_=False):
+def _pico_packet(
+    x, y, z, yaw, grip, trigger=0.0, close=False, open_=False, buttons=None
+):
     """Build one controller frame in the headset wire format."""
     from scipy.spatial.transform import Rotation as R
 
@@ -2907,7 +2909,7 @@ def _pico_packet(x, y, z, yaw, grip, trigger=0.0, close=False, open_=False):
             "grip": grip,
             "trigger": trigger,
         },
-        "buttons": {"A": close, "B": open_},
+        "buttons": {"A": close, "B": open_, **(buttons or {})},
     }
 
 
@@ -3000,6 +3002,50 @@ def test_continuous_trigger_is_reported_only_while_grip_is_held():
     assert active["gripper_trigger"] == pytest.approx(0.7)
     assert active["grip_close"] is False
     assert active["grip_open"] is False
+
+
+def test_vr_menu_requires_a_long_release_before_grip_can_drive(monkeypatch):
+    import rlinf.robotics.parts.transports.pico as pico_transport
+
+    now = iter((0.0, 1.1, 2.2, 2.3, 2.4))
+    monkeypatch.setattr(pico_transport.time, "monotonic", lambda: next(now))
+    reader = _pico_reader(
+        vr_control={"enabled": True, "menu_hold_s": 1.0, "button_debounce_s": 0.0}
+    )
+
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0.95)
+    assert reader.get_reading()["vr_enabled"] is False
+
+    reader._snapshot = lambda: _pico_packet(
+        0, 0, 0, 0, grip=0.95, buttons={"right_menu_button": True}
+    )
+    reader.get_reading()
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0.95)
+    enabled = reader.get_reading()
+    assert enabled["control_event"] == "vr_enabled"
+    assert enabled["held"] is False
+
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0.0)
+    reader.get_reading()
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0.95)
+    assert reader.get_reading()["held"] is True
+
+
+def test_vr_a_x_combination_suppresses_discard_and_requests_reset(monkeypatch):
+    import rlinf.robotics.parts.transports.pico as pico_transport
+
+    now = iter((0.0, 0.05, 0.10))
+    monkeypatch.setattr(pico_transport.time, "monotonic", lambda: next(now))
+    reader = _pico_reader(
+        vr_control={"enabled": True, "button_debounce_s": 0.0, "combo_window_s": 0.15}
+    )
+    reader._vr_enabled = True
+    reader._await_grip_release = False
+
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0, buttons={"A": True})
+    assert reader.get_reading()["control_event"] is None
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0, buttons={"A": True, "X": True})
+    assert reader.get_reading()["control_event"] == "robot_reset"
 
 
 def test_right_axis_click_recalibrates_without_trigger_recalibrating():

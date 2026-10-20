@@ -16,8 +16,8 @@ def register() -> None:
     from . import cameras  # noqa: F401
     from .collection import (
         install_rich_pico_info,
-        register_keyboard_timeout_mode,
+        register_pico_timeout_mode,
     )
 
-    register_keyboard_timeout_mode()
+    register_pico_timeout_mode()
     install_rich_pico_info()

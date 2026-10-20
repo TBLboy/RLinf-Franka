@@ -81,18 +81,12 @@ env:
     # 看门狗长，才能让正常的「按 a 后连续录制」由看门狗先收尾。
     # ⚠️ 若按 a 前空等超过 60 秒，外层兜底仍可能先触发；这不是成功 episode。
     max_episode_steps: 3600
-    # 键盘 episode 控制（D-021 / T-005）。键位以源码为准 —— ⚠️ 官方双臂 Pico 配置
-    # 第 67-70 行的注释描述的是 single_stage，与 start_end 语义不符（A-009）：
-    #   a = 开始录制；录制中再按一次 = 中止（丢弃缓冲，机械臂不动，不改 reward）
-    #   b = 分段（segment_advance，独立 1.0s 防抖）
-    #   c = 成功结束（reward=1.0，terminated=True）
-    # start_end_timeout 是 rlinf_ext 在官方 start_end 之上注册的扩展模式，只多一件事：
-    # 录制步数达到 3000（从 a 开始计数，5 分钟 @10Hz）就强制收尾，防操作者忘记
+    # Pico episode 控制：左摇杆按下开始，Y 成功结束并保存，X 丢弃；A+X 丢弃
+    # 当前轨迹并复位。pico_start_end_timeout 由 rlinf_ext 注册，录制步数达到
+    # 3000（从左摇杆按下开始计数，5 分钟 @10Hz）就强制收尾，防操作者忘记
     # 按 c。超时的 episode 不给成功奖励（不进 demos/，也不计入 num_data_episodes），
     # 但仍落 collected_data/*.pkl。
-    # ⚠️ 需要 RLINF_KEYBOARD_DEVICE 钉住真键盘：本机有 2 台键盘类设备
-    #    （Dell KB216 + BRLTTY 虚拟键盘），不钉会直接抛 RuntimeError（RS-007 / E-019）。
-    keyboard_reward_wrapper: "start_end_timeout"
+    keyboard_reward_wrapper: "pico_start_end_timeout"
     video_cfg:
       save_video: False
       info_on_video: False
@@ -118,6 +112,12 @@ env:
         # Trigger is reserved for continuous gripper control; push the right
         # thumbstick for a manual recalibration. Startup auto-calibration remains on.
         button: "right_axis_click"
+      vr_control:
+        enabled: true
+        menu_button: "right_menu_button"
+        menu_hold_s: 1.0
+        button_debounce_s: 0.04
+        combo_window_s: 0.15
 
     override_cfg:
       is_dummy: false

@@ -255,7 +255,10 @@ class Pico(TeleopDevice):
             "pico_hand": reading.get("hand"),
             "pico_calibrated": bool(reading.get("calibrated", False)),
             "pico_control_value": reading.get("control_value", 0.0),
+            "pico_vr_enabled": bool(reading.get("vr_enabled", True)),
         }
+        if reading.get("control_event") is not None:
+            info["pico_control_event"] = reading["control_event"]
         for key in ("stale", "invalid_pose"):
             if reading.get(key):
                 info[f"pico_{key}"] = True
