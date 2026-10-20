@@ -184,6 +184,25 @@ phase_preflight() {
     die "关键路径缺失，请先按文档《从零搭建流程》处理。"
   fi
 
+  local camera missing_camera=0
+  say ""
+  say "  相机视频节点："
+  for camera in \
+    "usb-Technologies__Inc._ZED_2i_OV0001-video-index0" \
+    "usb-Technologies__Inc._ZED-M-video-index0"; do
+    if [ -e "/dev/v4l/by-id/$camera" ]; then
+      say "  ✅ /dev/v4l/by-id/$camera → $(readlink -f "/dev/v4l/by-id/$camera")"
+    else
+      err "  ❌ 缺失：/dev/v4l/by-id/$camera"
+      missing_camera=1
+    fi
+  done
+  if [ "$missing_camera" = 1 ]; then
+    say "  ZED 相机只有 HID、没有 video 节点时，通常未接入 USB 3.0 数据路径。"
+    say "  请将缺失相机改接直连 USB 3.0 端口（不要使用 USB 2.0 hub），确认节点出现后重试。"
+    die "相机视频节点缺失，拒绝在连接 Franka 前启动采集"
+  fi
+
   say ""
   say "  网络接口："
   ip -4 -o addr show scope global 2>/dev/null | awk '{printf "    %-10s %s\n", $2, $4}' \
@@ -359,7 +378,7 @@ phase_headset() {
   say "       Network → PC Service → 填  $PC_IP"
   say "                              → Status 显示 WORKING"
   say "       Tracking → Head / Controller / Send  全部打开"
-  say "       Switch w/ A Button → 关闭（A 键要留给夹爪）"
+   say "       Switch w/ A Button → 关闭（A 键用于 A+X 复位组合键）"
   say "       PICO Motion Tracker → Mode → None"
   say ""
   say "  ③ 捏住 grip 两秒再松开（顺带确认手柄有反应）"
@@ -462,7 +481,7 @@ phase_collect() {
   say "  命令：bash scripts/run_collect_pico.sh $extra"
   say "  本次录制超时阈值：${RLINF_KEYBOARD_TIMEOUT_STEPS:-3000} 步"
   if [ -n "${RLINF_KEYBOARD_TIMEOUT_STEPS:-}" ]; then
-    warn "  ⚠️ 临时超时验证模式：按 a 后不要按 c，等待该步数自动收尾。"
+    warn "  ⚠️ 临时超时验证模式：左摇杆按下开始后，不按 Y，等待该步数自动收尾。"
   fi
   say "  出现进度条即启动成功（约 40~60 秒）。"
   say "  ★ 按 Ctrl-C 可随时停止，本脚本会自动完成收尾。"

@@ -53,3 +53,10 @@ def test_launcher_defaults_to_the_verified_vendor_sdk_environment() -> None:
     launcher = (ROOT / "scripts/run_pico_session.sh").read_text()
     assert "RLINF_PICO_SDK_VENV" in launcher
     assert "pico_software/XRoboToolkit-Teleop-Sample-Python/.venv" in launcher
+
+
+def test_launcher_requires_both_configured_camera_video_nodes() -> None:
+    launcher = (ROOT / "scripts/run_pico_session.sh").read_text()
+    assert "ZED_2i_OV0001-video-index0" in launcher
+    assert "ZED-M-video-index0" in launcher
+    assert "相机视频节点缺失" in launcher
