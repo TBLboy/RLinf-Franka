@@ -114,6 +114,10 @@ env:
         button: "right_axis_click"
       vr_control:
         enabled: true
+        # Temporary input-diagnostics bypass: start VR enabled because this Pico
+        # session publishes pose data but no controller buttons/grip. Keep the
+        # fresh-grip requirement; restore false after XRoboToolkit input is fixed.
+        start_enabled: true
         menu_button: "right_menu_button"
         menu_hold_s: 1.0
         button_debounce_s: 0.04

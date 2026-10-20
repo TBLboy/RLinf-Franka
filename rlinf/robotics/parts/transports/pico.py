@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
 from typing import Any, Mapping, Optional
 
 import numpy as np
@@ -197,13 +198,15 @@ class PicoExpert:
         self.menu_hold_s = float(vr_control_cfg.get("menu_hold_s", 1.0))
         self.button_debounce_s = float(vr_control_cfg.get("button_debounce_s", 0.04))
         self.combo_window_s = float(vr_control_cfg.get("combo_window_s", 0.15))
-        self._vr_enabled = not self.vr_control_enabled
+        self.vr_start_enabled = bool(vr_control_cfg.get("start_enabled", False))
+        self._vr_enabled = not self.vr_control_enabled or self.vr_start_enabled
         self._await_grip_release = self.vr_control_enabled
         self._menu_down_at: float | None = None
         self._button_down_at: dict[str, float] = {}
         self._button_accepted: set[str] = set()
         self._prev_buttons: dict[str, bool] = {}
         self._pending_ax: dict[str, float] = {}
+        self._control_events: deque[str] = deque()
 
         self.start()
 
@@ -277,7 +280,12 @@ class PicoExpert:
             self._deactivate()
             return {**idle, "stale": True}
 
-        control_event = self._update_vr_controls(data)
+        # Production input edges are captured in the 80 Hz receive loop. The
+        # fallback keeps isolated readers, which do not start that loop, usable.
+        if not self._running:
+            self._update_vr_controls(data)
+        with self._lock:
+            control_event = self._control_events.popleft() if self._control_events else None
         if self.vr_control_enabled and not self._vr_enabled:
             self._deactivate()
             return {
@@ -367,10 +375,10 @@ class PicoExpert:
             "grip_open": open_pressed,
         }
 
-    def _update_vr_controls(self, data: Mapping[str, Any]) -> str | None:
-        """Advance the configured VR control state and return one edge event."""
+    def _update_vr_controls(self, data: Mapping[str, Any]) -> None:
+        """Capture VR button edges at packet rate for later environment consumption."""
         if not self.vr_control_enabled:
-            return None
+            return
 
         now = time.monotonic()
         buttons = data.get("buttons", {})
@@ -382,15 +390,14 @@ class PicoExpert:
             if now - self._menu_down_at >= self.menu_hold_s:
                 self._vr_enabled = True
                 self._await_grip_release = True
-                event = "vr_enabled"
+                self._control_events.append("vr_enabled")
             else:
                 self._vr_enabled = False
                 self._await_grip_release = True
-                self._deactivate()
-                event = "vr_paused"
+                self._control_events.append("vr_paused")
             self._menu_down_at = None
             self._prev_buttons[self.menu_button] = menu_pressed
-            return event
+            return
         self._prev_buttons[self.menu_button] = menu_pressed
 
         watched = ("left_axis_click", "Y", "A", "X")
@@ -412,18 +419,20 @@ class PicoExpert:
                     self._pending_ax[name] = now
                 elif self._vr_enabled:
                     self._prev_buttons[name] = pressed
-                    return "record_start" if name == "left_axis_click" else "record_success"
+                    self._control_events.append(
+                        "record_start" if name == "left_axis_click" else "record_success"
+                    )
             self._prev_buttons[name] = pressed
 
         if not self._vr_enabled:
             self._pending_ax.clear()
-            return None
+            return
         if {"A", "X"} <= self._pending_ax.keys():
             if abs(self._pending_ax["A"] - self._pending_ax["X"]) <= self.combo_window_s:
                 self._pending_ax.clear()
                 self._await_grip_release = True
-                self._deactivate()
-                return "robot_reset"
+                self._control_events.append("robot_reset")
+                return
         expired = [
             name
             for name, accepted_at in self._pending_ax.items()
@@ -432,8 +441,7 @@ class PicoExpert:
         for name in expired:
             self._pending_ax.pop(name)
             if name == "X":
-                return "record_discard"
-        return None
+                self._control_events.append("record_discard")
 
     def _recv_loop(self) -> None:
         while self._running:
@@ -443,6 +451,7 @@ class PicoExpert:
                 with self._lock:
                     self._latest_data = data
                     self._last_update_time = time.time()
+                    self._update_vr_controls(data)
             except zmq.error.Again:
                 continue
             except Exception as exc:

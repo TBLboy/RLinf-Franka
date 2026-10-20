@@ -3048,6 +3048,33 @@ def test_vr_a_x_combination_suppresses_discard_and_requests_reset(monkeypatch):
     assert reader.get_reading()["control_event"] == "robot_reset"
 
 
+def test_vr_can_start_enabled_but_still_requires_a_fresh_grip():
+    reader = _pico_reader(vr_control={"enabled": True, "start_enabled": True})
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0.95)
+
+    reading = reader.get_reading()
+
+    assert reading["vr_enabled"] is True
+    assert reading["held"] is False
+
+
+def test_vr_button_edges_captured_before_environment_read_are_not_lost(monkeypatch):
+    import rlinf.robotics.parts.transports.pico as pico_transport
+
+    now = iter((0.0, 0.05, 0.10))
+    monkeypatch.setattr(pico_transport.time, "monotonic", lambda: next(now))
+    reader = _pico_reader(vr_control={"enabled": True, "button_debounce_s": 0.0})
+    reader._vr_enabled = True
+    reader._await_grip_release = False
+    reader._running = True
+
+    reader._update_vr_controls(_pico_packet(0, 0, 0, 0, grip=0, buttons={"Y": True}))
+    reader._update_vr_controls(_pico_packet(0, 0, 0, 0, grip=0))
+    reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0)
+
+    assert reader.get_reading()["control_event"] == "record_success"
+
+
 def test_right_axis_click_recalibrates_without_trigger_recalibrating():
     reader = _pico_reader(
         calibration={
