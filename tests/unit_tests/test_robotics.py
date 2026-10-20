@@ -764,7 +764,10 @@ def test_every_canonical_arm_reports_the_same_fields_from_one_place():
                 f"{driver.__name__} writes its own {inherited}; the three of "
                 "them had the same body three times"
             )
-        assert set(driver.STATE_FIELDS) == set(ARM_STATE_FIELDS)
+        expected = set(ARM_STATE_FIELDS)
+        if driver is FrankyArm:
+            expected |= {"arm_joint_torque", "state_read_monotonic_ns"}
+        assert set(driver.STATE_FIELDS) == expected
         assert "get_state" in vars(driver), f"{driver.__name__} must supply state"
 
     # Robot builders depend on the category interface.
@@ -895,7 +898,9 @@ def test_a_robot_composes_an_arm_and_gets_what_rides_on_it():
 
         # Readings preserve the composed tree structure.
         assert set(robot.observation_features["arm"]) >= {"tcp_pose"}
-        assert set(robot.observation_features["end_effector"]) == {"state"}
+        assert set(robot.observation_features["end_effector"]) == {
+            "state", "state_read_monotonic_ns"
+        }
         assert set(robot.action_features["arm"]) == {"tcp_pose", "joint_position"}
         assert set(robot.action_features["end_effector"]) == {"target"}
 
@@ -3085,25 +3090,48 @@ def test_vr_record_start_accepts_a_single_packet_edge(monkeypatch):
     reader._running = True
 
     reader._update_vr_controls(
-        _pico_packet(0, 0, 0, 0, grip=0, buttons={"left_axis_click": True})
+        _pico_packet(0, 0, 0, 0, grip=0, buttons={"left_axis_click": True}),
+        received_ns=123456789,
     )
     reader._snapshot = lambda: _pico_packet(0, 0, 0, 0, grip=0)
 
-    assert reader.get_reading()["control_event"] == "record_start"
+    reading = reader.get_reading()
+    assert reading["control_event"] == "record_start"
+    assert reading["pico_control_event_monotonic_ns"] == 123456789
+
+
+def test_pico_raw_packet_drain_preserves_order_and_reports_overflow():
+    reader = _pico_reader(vr_control={"enabled": True})
+    reader._raw_packets.extend([
+        {"timestamp_ns": 10, "value": {"timestamp_ns": 100}},
+        {"timestamp_ns": 20, "value": {"timestamp_ns": 200}},
+    ])
+    reader._raw_packet_overflow = True
+
+    reading = reader.get_reading()
+    packets = reading["pico_raw_packets"]
+    overflow = reading["pico_raw_packet_overflow"]
+
+    assert [packet["timestamp_ns"] for packet in packets] == [10, 20]
+    assert [packet["value"]["timestamp_ns"] for packet in packets] == [100, 200]
+    assert overflow is True
+    reading = reader.get_reading()
+    assert reading["pico_raw_packets"] == []
+    assert reading["pico_raw_packet_overflow"] is False
 
 
 def test_reset_discards_button_edges_captured_while_the_arm_was_resetting():
     reader = _pico_reader(vr_control={"enabled": True})
-    reader._control_events.extend(("record_start", "record_success"))
+    reader._control_events.extend((("record_start", 1), ("record_success", 2)))
 
     reader.discard_control_events(keep_record_start=True)
 
-    assert list(reader._control_events) == ["record_start"]
+    assert list(reader._control_events) == [("record_start", 1)]
 
 
 def test_reset_discards_all_events_when_no_next_recording_is_requested():
     reader = _pico_reader(vr_control={"enabled": True})
-    reader._control_events.extend(("record_success", "record_discard", "robot_reset"))
+    reader._control_events.extend((("record_success", 1), ("record_discard", 2), ("robot_reset", 3)))
 
     reader.discard_control_events(keep_record_start=True)
 
@@ -3112,7 +3140,7 @@ def test_reset_discards_all_events_when_no_next_recording_is_requested():
 
 def test_before_reset_discards_preexisting_pico_events():
     reader = _pico_reader(vr_control={"enabled": True})
-    reader._control_events.append("record_start")
+    reader._control_events.append(("record_start", 1))
 
     reader.discard_control_events()
 
@@ -3432,7 +3460,7 @@ def test_every_end_effector_answers_the_same_questions():
             assert part.state_dim >= 1 and part.action_dim >= 1, label
             assert part.control_mode in {"binary", "continuous"}, label
             assert callable(part.get_state) and callable(part.command), label
-            assert set(part.observation_features) == {"state"}, label
+            assert "state" in part.observation_features, label
             assert set(part.action_features) == {"target"}, label
 
         # A six-finger hand composes exactly where a gripper would.
@@ -3448,7 +3476,7 @@ def test_every_end_effector_reports_its_state_under_the_same_name():
 
         for part in (gripper, hand):
             name = type(part).__name__
-            assert set(part.observation_features) == {"state"}, (
+            assert "state" in part.observation_features, (
                 f"{name} reports {sorted(part.observation_features)}, not 'state'"
             )
             assert set(part.action_features) == {"target"}, name
@@ -3458,7 +3486,7 @@ def test_every_end_effector_reports_its_state_under_the_same_name():
             part.connect()
             try:
                 observation = part.get_observation()
-                assert set(observation) == {"state"}, name
+                assert set(observation) == set(part.observation_features), name
                 assert observation["state"].shape == (part.state_dim,), name
                 target = np.zeros(part.action_dim, dtype=np.float32)
                 assert set(part.send_action({"target": target})) == {"target"}, name
@@ -3930,6 +3958,21 @@ def test_franky_realtime_mode_follows_the_arm_setting(franky_arm):
 
     with pytest.raises(ValueError, match="realtime_config"):
         FrankyArm.declare("10.0.0.1", realtime_config="best_effort")
+
+
+def test_robotiq_failed_status_read_does_not_forge_fresh_timestamp(monkeypatch):
+    from rlinf.robotics.parts.end_effectors.grippers.robotiq import RobotiqGripper
+    import rlinf.robotics.parts.end_effectors.grippers.robotiq as module
+
+    gripper = RobotiqGripper("/dev/fake")
+    reads = iter(({"position": 128}, None))
+    monkeypatch.setattr(gripper, "_read_status", lambda: next(reads))
+    monkeypatch.setattr(module.time, "monotonic_ns", lambda: 123)
+    first = gripper.get_observation()
+    second = gripper.get_observation()
+    assert first["state_read_monotonic_ns"] == 123
+    assert second["state_read_monotonic_ns"] == 123
+    np.testing.assert_array_equal(first["state"], second["state"])
 
 
 def test_franky_applies_explicit_cartesian_damping(franky_arm):

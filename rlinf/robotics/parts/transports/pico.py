@@ -177,6 +177,7 @@ class PicoExpert:
         self._lock = threading.Lock()
         self._latest_data: Optional[dict[str, Any]] = None
         self._last_update_time = 0.0
+        self._latest_receive_monotonic_ns = 0
 
         self._context = None
         self._socket = None
@@ -206,7 +207,10 @@ class PicoExpert:
         self._button_accepted: set[str] = set()
         self._prev_buttons: dict[str, bool] = {}
         self._pending_ax: dict[str, float] = {}
-        self._control_events: deque[str] = deque()
+        self._control_events: deque[tuple[str, int]] = deque()
+        self._raw_packets: deque[dict[str, Any]] = deque()
+        self._raw_packet_limit = 8192
+        self._raw_packet_overflow = False
 
         self.start()
 
@@ -278,14 +282,29 @@ class PicoExpert:
         data = self._snapshot()
         if data is None:
             self._deactivate()
+            with self._lock:
+                idle["pico_raw_packets"] = list(self._raw_packets)
+                idle["pico_raw_packet_overflow"] = self._raw_packet_overflow
+                self._raw_packets.clear()
+                self._raw_packet_overflow = False
             return {**idle, "stale": True}
+
+        idle["pico_vendor_timestamp_ns"] = data.get("timestamp_ns")
+        idle["pico_received_monotonic_ns"] = data.get("host_received_monotonic_ns")
+        idle["pico_raw_packet"] = data
 
         # Production input edges are captured in the 80 Hz receive loop. The
         # fallback keeps isolated readers, which do not start that loop, usable.
         if not self._running:
             self._update_vr_controls(data)
         with self._lock:
-            control_event = self._control_events.popleft() if self._control_events else None
+            event = self._control_events.popleft() if self._control_events else None
+            control_event = event[0] if event else None
+            idle["pico_control_event_monotonic_ns"] = event[1] if event else None
+            idle["pico_raw_packets"] = list(self._raw_packets)
+            idle["pico_raw_packet_overflow"] = self._raw_packet_overflow
+            self._raw_packets.clear()
+            self._raw_packet_overflow = False
         if self.vr_control_enabled and not self._vr_enabled:
             self._deactivate()
             return {
@@ -302,12 +321,14 @@ class PicoExpert:
             and not self._calibrated
         ):
             self._deactivate()
-            return {**idle, "ready": True, "calibrated": False}
+            return {**idle, "ready": True, "calibrated": False,
+                    "control_event": control_event}
 
         pose = self._controller_pose(data, self.hand)
         if not _is_valid_pose(pose):
             self._deactivate()
-            return {**idle, "ready": True, "invalid_pose": True}
+            return {**idle, "ready": True, "invalid_pose": True,
+                    "control_event": control_event}
 
         control_value = self._control_value(data, self.hand, self.control_trigger)
         if self._await_grip_release:
@@ -375,12 +396,15 @@ class PicoExpert:
             "grip_open": open_pressed,
         }
 
-    def _update_vr_controls(self, data: Mapping[str, Any]) -> None:
+    def _update_vr_controls(
+        self, data: Mapping[str, Any], received_ns: Optional[int] = None
+    ) -> None:
         """Capture VR button edges at packet rate for later environment consumption."""
         if not self.vr_control_enabled:
             return
 
         now = time.monotonic()
+        event_ns = received_ns if received_ns is not None else time.monotonic_ns()
         buttons = data.get("buttons", {})
         menu_pressed = bool(buttons.get(self.menu_button, False))
         previous_menu = self._prev_buttons.get(self.menu_button, False)
@@ -390,11 +414,11 @@ class PicoExpert:
             if now - self._menu_down_at >= self.menu_hold_s:
                 self._vr_enabled = True
                 self._await_grip_release = True
-                self._control_events.append("vr_enabled")
+                self._control_events.append(("vr_enabled", event_ns))
             else:
                 self._vr_enabled = False
                 self._await_grip_release = True
-                self._control_events.append("vr_paused")
+                self._control_events.append(("vr_paused", event_ns))
             self._menu_down_at = None
             self._prev_buttons[self.menu_button] = menu_pressed
             return
@@ -420,9 +444,10 @@ class PicoExpert:
                     self._pending_ax[name] = now
                 elif self._vr_enabled:
                     self._prev_buttons[name] = pressed
-                    self._control_events.append(
-                        "record_start" if name == "left_axis_click" else "record_success"
-                    )
+                    self._control_events.append((
+                        "record_start" if name == "left_axis_click" else "record_success",
+                        event_ns,
+                    ))
             self._prev_buttons[name] = pressed
 
         if not self._vr_enabled:
@@ -432,7 +457,7 @@ class PicoExpert:
             if abs(self._pending_ax["A"] - self._pending_ax["X"]) <= self.combo_window_s:
                 self._pending_ax.clear()
                 self._await_grip_release = True
-                self._control_events.append("robot_reset")
+                self._control_events.append(("robot_reset", event_ns))
                 return
         expired = [
             name
@@ -442,17 +467,26 @@ class PicoExpert:
         for name in expired:
             self._pending_ax.pop(name)
             if name == "X":
-                self._control_events.append("record_discard")
+                self._control_events.append(("record_discard", event_ns))
 
     def _recv_loop(self) -> None:
         while self._running:
             try:
                 msg_bytes = self._socket.recv()
+                received_ns = time.monotonic_ns()
                 data = json.loads(msg_bytes.decode("utf-8"))
                 with self._lock:
                     self._latest_data = data
                     self._last_update_time = time.time()
-                    self._update_vr_controls(data)
+                    self._latest_receive_monotonic_ns = received_ns
+                    if len(self._raw_packets) >= self._raw_packet_limit:
+                        self._raw_packet_overflow = True
+                    else:
+                        self._raw_packets.append({
+                            "timestamp_ns": received_ns,
+                            "value": data,
+                        })
+                    self._update_vr_controls(data, received_ns=received_ns)
             except zmq.error.Again:
                 continue
             except Exception as exc:
@@ -467,7 +501,10 @@ class PicoExpert:
                 return None
             if time.time() - self._last_update_time > self.max_stale_s:
                 return None
-            return dict(self._latest_data)
+            return {
+                **self._latest_data,
+                "host_received_monotonic_ns": self._latest_receive_monotonic_ns,
+            }
 
     def _activate(self, controller_pos: np.ndarray, controller_rot: R) -> None:
         self._ref_controller_pos = controller_pos.copy()
@@ -486,7 +523,7 @@ class PicoExpert:
         with self._lock:
             if keep_record_start:
                 self._control_events = deque(
-                    event for event in self._control_events if event == "record_start"
+                    event for event in self._control_events if event[0] == "record_start"
                 )
             else:
                 self._control_events.clear()

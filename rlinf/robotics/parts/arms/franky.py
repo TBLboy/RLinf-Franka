@@ -30,7 +30,12 @@ from typing import Any, ClassVar, NoReturn, Optional
 import numpy as np
 from scipy.spatial.transform import Rotation as R
 
-from rlinf.robotics.parts.arms.base import Arm, BaseArm, CartesianCompliance
+from rlinf.robotics.parts.arms.base import (
+    ARM_STATE_FIELDS,
+    Arm,
+    BaseArm,
+    CartesianCompliance,
+)
 from rlinf.robotics.parts.arms.franka import (
     JOINT_LIMITS_LOWER,
     JOINT_LIMITS_UPPER,
@@ -46,6 +51,8 @@ from rlinf.utils.logging import get_logger
 @Arm.register("franky")
 class FrankyArm(BaseArm):
     """Franka arm controlled through libfranka by Franky."""
+
+    STATE_FIELDS = (*ARM_STATE_FIELDS, "arm_joint_torque", "state_read_monotonic_ns")
 
     #: Collision reflex trip points, in Nm and N.
     TORQUE_THRESHOLD: ClassVar[list[float]] = [80.0] * 4 + [11.0] * 3
@@ -218,9 +225,12 @@ class FrankyArm(BaseArm):
             raise KeyError(f"Unknown Franky actions: {sorted(unknown)}")
         if "joint_position" in action:
             self.move_joints(action["joint_position"])
+        result = dict(action)
         if "tcp_pose" in action:
-            self.move_tcp_pose(action["tcp_pose"])
-        return action
+            result["tcp_pose"] = self.move_tcp_pose(action["tcp_pose"])
+            result["send_started_monotonic_ns"] = self._last_cart_send_started_ns
+            result["send_completed_monotonic_ns"] = self._last_cart_send_completed_ns
+        return result
 
     def _release(self, device: Any) -> None:
         """Stop active motion and drop the libfranka session."""
@@ -282,6 +292,7 @@ class FrankyArm(BaseArm):
     def get_state(self) -> FrankaRobotState:
         self._check_tracking_motion()
         raw = self._robot.state
+        state_read_monotonic_ns = time.monotonic_ns()
         affine = raw.O_T_EE
         # Franky and SciPy both use xyzw quaternion order.
         tcp_pose = np.concatenate(
@@ -304,6 +315,7 @@ class FrankyArm(BaseArm):
         s.arm_joint_position = joint_pos
         s.arm_joint_velocity = joint_vel
         s.arm_joint_torque = joint_torque
+        s.state_read_monotonic_ns = state_read_monotonic_ns
         s.tcp_force = K_F_ext[:3]
         s.tcp_torque = K_F_ext[3:]
         s.arm_jacobian = jacobian
@@ -561,7 +573,7 @@ class FrankyArm(BaseArm):
             self._prev_cart_target_quat = None
         self._robot.recover_from_errors()
 
-    def move_tcp_pose(self, pose: np.ndarray) -> None:
+    def move_tcp_pose(self, pose: np.ndarray) -> np.ndarray:
         # Twist feedforward from 10 Hz finite differences destabilizes joint 7.
         # Pose layout: xyz position followed by an xyzw quaternion.
         pose = np.asarray(pose, dtype=np.float64)
@@ -614,8 +626,12 @@ class FrankyArm(BaseArm):
         T[:3, :3] = R.from_quat(quat).as_matrix()
         T[:3, 3] = xyz
 
-        self._cart_tracker.set_target(self._franky.Affine(T))
+        target = self._franky.Affine(T)
+        self._last_cart_send_started_ns = time.monotonic_ns()
+        self._cart_tracker.set_target(target)
+        self._last_cart_send_completed_ns = time.monotonic_ns()
         self._check_tracking_motion()
+        return np.concatenate((xyz, self._prev_cart_target_quat)).copy()
 
     def reset_joint(self, positions: list[float]) -> None:
         assert len(positions) == 7

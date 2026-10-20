@@ -93,11 +93,16 @@ class DataCollector(Worker):
 
     def _process_obs(self, obs):
         """Reshape env observations for the internal trajectory accumulator."""
-        if not self.cfg.runner.record_task_description:
-            obs.pop("task_descriptions", None)
-
         ret_obs = {}
         for key, val in obs.items():
+            # Independent acquisition metadata is archived by CollectEpisode in
+            # PKL, not stacked into the policy's tensor-only trajectory buffer.
+            if key in ("raw_state", "training_state", "timestamps"):
+                continue
+            if key == "task_descriptions":
+                if self.cfg.runner.record_task_description:
+                    ret_obs[key] = list(val)
+                continue
             if isinstance(val, np.ndarray):
                 val = torch.from_numpy(val)
             val = val.cpu()

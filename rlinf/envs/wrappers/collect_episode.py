@@ -20,6 +20,8 @@ import json
 import os
 import pickle
 import re
+import tempfile
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from threading import Lock
 from typing import Any, Optional
@@ -166,6 +168,8 @@ class CollectEpisode(gym.Wrapper):
         self._episode_ids = [0] * num_envs
         self._episode_success = [False] * num_envs
         self._segment_ids: list[int] = [0] * num_envs
+        self._raw_episodes: list[Any] = [None] * num_envs
+        self._raw_preroll: list[Any] = [None] * num_envs
         self._global_step = 0
         # Holds the post-reset obs for auto-reset envs to prepend to next episode.
         self._pending_obs: list[Any] = [None] * num_envs
@@ -209,6 +213,8 @@ class CollectEpisode(gym.Wrapper):
             Tuple of (observation, info) from the underlying environment.
         """
         self._buffers = [self._new_buffer() for _ in range(self.num_envs)]
+        self._raw_episodes = [None] * self.num_envs
+        self._raw_preroll = [None] * self.num_envs
         self._episode_success = [False] * self.num_envs
         self._pending_obs = [None] * self.num_envs
         self._pending_info = [None] * self.num_envs
@@ -232,6 +238,7 @@ class CollectEpisode(gym.Wrapper):
         Returns:
             Tuple of (obs, reward, terminated, truncated, info).
         """
+        self._drain_futures()
         obs, reward, terminated, truncated, info = self.env.step(action, **kwargs)
         self._record_step(action, obs, reward, terminated, truncated, info)
         self._maybe_flush(terminated, truncated)
@@ -250,6 +257,7 @@ class CollectEpisode(gym.Wrapper):
         Returns:
             Tuple of (obs_list, rewards, terminations, truncations, infos_list).
         """
+        self._drain_futures()
         obs_list, rewards, terminations, truncations, infos_list = self.env.chunk_step(
             chunk_actions
         )
@@ -279,7 +287,7 @@ class CollectEpisode(gym.Wrapper):
                 else truncations
             )
             step_info = (
-                copy.deepcopy(infos_list[step_idx])
+                infos_list[step_idx]
                 if isinstance(infos_list, (list, tuple))
                 else infos_list
             )
@@ -294,13 +302,15 @@ class CollectEpisode(gym.Wrapper):
         if self._closed:
             return None
         self._closed = True
-        self._finalize_lerobot()
-        self._wait_futures()
-        if self._executor is not None:
-            self._executor.shutdown(wait=True)
-            self._executor = None
-        if hasattr(self.env, "close"):
-            return self.env.close()
+        try:
+            self._finalize_lerobot()
+            self._wait_futures()
+        finally:
+            if self._executor is not None:
+                self._executor.shutdown(wait=True)
+                self._executor = None
+            if hasattr(self.env, "close"):
+                self.env.close()
         return None
 
     def _new_buffer(self) -> dict[str, list]:
@@ -348,7 +358,7 @@ class CollectEpisode(gym.Wrapper):
         if has_final_obs:
             final_observation = info["final_observation"]
             final_info_batch = info["final_info"]
-            info_no_reset = copy.deepcopy(info)
+            info_no_reset = dict(info)
             info_no_reset.pop("final_observation")
             info_no_reset.pop("final_info")
 
@@ -376,19 +386,118 @@ class CollectEpisode(gym.Wrapper):
 
             record_reset = self._bool_from_env_info(env_info, "record_reset")
             pre_record = self._bool_from_env_info(env_info, "pre_record")
+            event = env_info.get("keyboard_event") if isinstance(env_info, dict) else None
+            event_ns = env_info.get("episode_event_monotonic_ns") if isinstance(env_info, dict) else None
+
+            if not record_reset and not pre_record and self._bool_from_env_info(env_info, "segment_advance"):
+                self._segment_ids[env_idx] += 1
+
+            if event == "record_start" and record_reset and event_ns is not None and not pre_record:
+                from rlinf_ext.raw_episode import RawEpisode
+
+                self._raw_episodes[env_idx] = RawEpisode(
+                    int(event_ns), {key: int(value) for key, value in
+                                    env_info.get("stream_periods_ns", {}).items()
+                                    if not key.startswith("_")}
+                )
+                previous = self._raw_preroll[env_idx]
+                if previous is not None:
+                    for name, samples in previous.streams.items():
+                        self._raw_episodes[env_idx].append(name, samples, owned=True)
+                self._raw_preroll[env_idx] = None
+            raw = self._raw_episodes[env_idx]
+            if raw is None and pre_record and "stream_periods_ns" in env_info:
+                from rlinf_ext.raw_episode import RawEpisode
+
+                if self._raw_preroll[env_idx] is None:
+                    self._raw_preroll[env_idx] = RawEpisode(1, {})
+                raw = self._raw_preroll[env_idx]
+            if raw is not None and isinstance(env_info, dict):
+                def samples_from(value):
+                    # Gym's vector info can represent a batch as an object ndarray
+                    # instead of the original list; preserve each paired sample.
+                    if isinstance(value, np.ndarray):
+                        value = value.tolist()
+                    if not isinstance(value, list) or any(not isinstance(x, dict) for x in value):
+                        raise ValueError("raw source batch is malformed")
+                    return value
+
+                packets = env_info.get("pico_raw_packets", [])
+                raw.append("pico", samples_from(packets), overflow=bool(env_info.get("pico_raw_packet_overflow", False)))
+                batches = env_info.get("camera_raw_batches", {})
+                overflows = env_info.get("camera_raw_overflow", {})
+                if isinstance(batches, dict):
+                    for name, samples in batches.items():
+                        if not str(name).startswith("_"):
+                            raw.append(name, samples_from(samples), overflow=bool(overflows.get(name, False)), owned=True)
+                if event_ns is not None and event is not None and not pre_record:
+                    raw.events.append({"timestamp_ns": int(event_ns), "event": event})
+                timestamps = env_obs.get("timestamps", {}) if isinstance(env_obs, dict) else {}
+                if isinstance(timestamps, dict) and "states" in env_obs:
+                    robot_ns = timestamps.get("robot_read_monotonic_ns")
+                    source_state = env_obs.get("training_state", env_obs.get("raw_state", {}))
+                    if robot_ns is not None and int(robot_ns) > 0 and isinstance(source_state, dict):
+                        arm_state = {k: self._copy(v) for k, v in source_state.items() if k != "gripper_position"}
+                        raw.append("robot", [{
+                            "timestamp_ns": int(robot_ns),
+                            "value": {
+                                "state_fields": arm_state,
+                                "robot_state_fields": self._copy(env_obs.get("raw_state", {})),
+                            },
+                        }])
+                    gripper_ns = timestamps.get("gripper_read_monotonic_ns")
+                    if gripper_ns is not None and int(gripper_ns) > 0 and "gripper_position" in source_state:
+                        existing = raw.streams.get("gripper", [])
+                        # A failed Modbus read reuses the last valid reading and
+                        # timestamp; never fabricate a fresh sample.
+                        if not existing or int(gripper_ns) > existing[-1]["timestamp_ns"]:
+                            raw.append("gripper", [{
+                                "timestamp_ns": int(gripper_ns),
+                                "value": self._copy(source_state["gripper_position"]),
+                            }])
+                if ("post_guard_tcp_pose" in env_info
+                        and "post_guard_send_started_monotonic_ns" in env_info):
+                    raw.append("action", [{
+                        "timestamp_ns": int(env_info["post_guard_send_started_monotonic_ns"]),
+                        "value": {
+                            "tcp_pose": self._copy(env_info["post_guard_tcp_pose"]),
+                            "action": self._copy(env_info["post_guard_action"]),
+                            "action_base": self._copy(env_info.get("post_guard_action_base", env_info["post_guard_action"])),
+                            "action_frame": env_info.get("post_guard_action_frame", "unspecified"),
+                            "send_completed_monotonic_ns": int(env_info["post_guard_send_completed_monotonic_ns"]),
+                            "gripper_command_metadata": self._copy(env_info.get("gripper_command_metadata")),
+                            "intervene_flag": bool(np.asarray(env_info.get("intervene_flag", False)).any()),
+                            "segment_id": int(self._segment_ids[env_idx]),
+                        },
+                    }])
+
+                # Raw payloads have one archival owner, not a second copy in infos.
+                env_info.pop("camera_raw_batches", None)
+                env_info.pop("pico_raw_packets", None)
+                # Training images live in independent timestamped streams only.
+                # The returned observation remains intact for the runner.
+                if isinstance(env_obs, dict):
+                    for key in ("main_images", "extra_view_images", "wrist_images"):
+                        env_obs.pop(key, None)
+                if pre_record:
+                    # Keep two real samples per stream, bounded independently of
+                    # how long the operator waits before recording.
+                    raw.streams = {name: samples[-2:] for name, samples in raw.streams.items()}
+                    raw.payload_bytes = 0
+                    raw.losses.clear()
 
             if record_reset:
                 self._buffers[env_idx] = self._new_buffer()
                 self._episode_success[env_idx] = False
                 self._segment_ids[env_idx] = 0
                 self._seed_reset_frame(env_idx, env_obs)
+                if event in ("record_discard", "robot_reset"):
+                    self._raw_episodes[env_idx] = None
+                    self._raw_preroll[env_idx] = None
                 continue
 
             if pre_record:
                 continue
-
-            if self._bool_from_env_info(env_info, "segment_advance"):
-                self._segment_ids[env_idx] += 1
 
             buf = self._buffers[env_idx]
             buf["observations"].append(env_obs)
@@ -407,6 +516,8 @@ class CollectEpisode(gym.Wrapper):
         self._buffers[env_idx] = self._new_buffer()
         self._episode_success[env_idx] = False
         self._segment_ids[env_idx] = 0
+        self._raw_episodes[env_idx] = None
+        self._raw_preroll[env_idx] = None
 
         if self._pending_obs[env_idx] is not None:
             self._buffers[env_idx]["observations"].append(self._pending_obs[env_idx])
@@ -452,7 +563,7 @@ class CollectEpisode(gym.Wrapper):
             if ep_data is not None:
                 self._submit(self._write_lerobot_episode, ep_data)
         else:
-            episode_data = self._copy(
+            episode_data = (
                 {
                     "rank": self.rank,
                     "env_idx": env_idx,
@@ -471,6 +582,15 @@ class CollectEpisode(gym.Wrapper):
                     "segment_ids": buf["segment_ids"],
                 }
             )
+            raw = self._raw_episodes[env_idx]
+            if raw is not None:
+                terminal_events = [event for event in raw.events if event["event"] in ("record_success", "timeout")]
+                if not terminal_events:
+                    raw.events.append({"timestamp_ns": time.monotonic_ns(), "event": "external_end"})
+                    raw.losses["missing_terminal_event"] = 1
+                    terminal_events = raw.events[-1:]
+                episode_data.update(raw.seal(terminal_events[-1]["timestamp_ns"]))
+                episode_data["task_description"] = self._extract_task_description(buf, env_idx)
             label = "success" if is_success else "fail"
             filename = (
                 f"rank_{self.rank}_env_{env_idx}_"
@@ -628,12 +748,24 @@ class CollectEpisode(gym.Wrapper):
                 self._lerobot_writer = None
 
     def _write_pickle(self, save_path: str, episode_data: dict) -> None:
-        with open(save_path, "wb") as f:
-            pickle.dump(episode_data, f)
+        fd, temporary = tempfile.mkstemp(dir=os.path.dirname(save_path), suffix=".partial")
+        try:
+            with os.fdopen(fd, "wb") as f:
+                pickle.dump(episode_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temporary, save_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def _submit(self, fn, *args) -> None:
         if self._executor is None:
-            return
+            raise RuntimeError("collection writer is closed")
+        self._drain_futures()
+        # Bound queued episode memory; never drop an episode under disk pressure.
+        if self._futures:
+            self._wait_futures()
         self._futures.append(self._executor.submit(fn, *args))
         self.logger.info(f"Futures queue length: {len(self._futures)}")
         self._drain_futures()

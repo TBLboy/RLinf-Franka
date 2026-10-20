@@ -259,6 +259,16 @@ class Pico(TeleopDevice):
         }
         if reading.get("control_event") is not None:
             info["pico_control_event"] = reading["control_event"]
+        for field in (
+            "pico_vendor_timestamp_ns",
+            "pico_received_monotonic_ns",
+            "pico_raw_packet",
+            "pico_raw_packets",
+            "pico_raw_packet_overflow",
+            "pico_control_event_monotonic_ns",
+        ):
+            if reading.get(field) is not None:
+                info[field] = reading[field]
         for key in ("stale", "invalid_pose"):
             if reading.get(key):
                 info[f"pico_{key}"] = True

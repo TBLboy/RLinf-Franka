@@ -184,7 +184,8 @@ phase_preflight() {
     die "关键路径缺失，请先按文档《从零搭建流程》处理。"
   fi
 
-  local camera missing_camera=0
+  local camera missing_camera=0 busy_camera=0 camera_pids
+  command -v fuser >/dev/null 2>&1 || die "缺少 fuser，请安装 psmisc 后检查相机占用"
   say ""
   say "  相机视频节点："
   for camera in \
@@ -192,6 +193,11 @@ phase_preflight() {
     "usb-Technologies__Inc._ZED-M-video-index0"; do
     if [ -e "/dev/v4l/by-id/$camera" ]; then
       say "  ✅ /dev/v4l/by-id/$camera → $(readlink -f "/dev/v4l/by-id/$camera")"
+      camera_pids="$(fuser "/dev/v4l/by-id/$camera" 2>/dev/null || true)"
+      if [ -n "$camera_pids" ]; then
+        err "  ❌ 相机被其他进程占用：$camera，PID：$camera_pids"
+        busy_camera=1
+      fi
     else
       err "  ❌ 缺失：/dev/v4l/by-id/$camera"
       missing_camera=1
@@ -201,6 +207,10 @@ phase_preflight() {
     say "  ZED 相机只有 HID、没有 video 节点时，通常未接入 USB 3.0 数据路径。"
     say "  请将缺失相机改接直连 USB 3.0 端口（不要使用 USB 2.0 hub），确认节点出现后重试。"
     die "相机视频节点缺失，拒绝在连接 Franka 前启动采集"
+  fi
+
+  if [ "$busy_camera" = 1 ]; then
+    die "请先关闭相机预览或退出占用相机的应用；拒绝在连接 Franka 前启动采集（不会自动终止其他进程）"
   fi
 
   say ""

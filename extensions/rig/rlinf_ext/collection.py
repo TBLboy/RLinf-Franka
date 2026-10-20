@@ -24,6 +24,7 @@ Rich PICO info
 from __future__ import annotations
 
 import os
+import time
 from typing import Any, Mapping
 
 import gymnasium as gym
@@ -162,6 +163,12 @@ class PicoStartEndTimeout(gym.Wrapper):
         if event is not None:
             info["pico_event_status"] = event_status or "forwarded"
             info["pico_recording_before"] = recording_before
+            if event_status == "accepted" and event in ("record_start", "record_success", "record_discard", "robot_reset"):
+                captured = info.get("pico_control_event_monotonic_ns")
+                if captured is not None:
+                    info["episode_event_monotonic_ns"] = int(captured)
+            elif event == "timeout":
+                info["episode_event_monotonic_ns"] = time.monotonic_ns()
             _logger.info(
                 "Pico event=%s status=%s recording=%s record_reset=%s",
                 event,

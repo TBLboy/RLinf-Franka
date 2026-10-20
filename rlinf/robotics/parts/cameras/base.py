@@ -88,6 +88,7 @@ class BaseCamera(Camera, ABC):
         self._frame_capturing_start = False
         self._depth_scale = 1.0
         self._latest_frame: Optional[tuple[float, np.ndarray]] = None
+        self._frame_read_monotonic_ns: Optional[int] = None
 
     @property
     def name(self) -> str:
@@ -182,7 +183,7 @@ class BaseCamera(Camera, ABC):
         fixed control period that would rather reuse its last observation than
         wait out the default timeout.
         """
-        frame = self.get_frame(
+        captured_at, frame = self._get_timestamped_frame(
             timeout=timeout, attempts=attempts, wait=wait, max_age=max_age
         )
         if not self._camera_info.enable_depth:
@@ -219,6 +220,19 @@ class BaseCamera(Camera, ABC):
         Raises:
             queue.Empty: If no attempt produced a frame.
         """
+        return self._get_timestamped_frame(
+            timeout=timeout, attempts=attempts, wait=wait, max_age=max_age
+        )[1]
+
+    def _get_timestamped_frame(
+        self,
+        timeout: float = 5,
+        attempts: int = 1,
+        wait: float = 0.0,
+        *,
+        max_age: Optional[float] = None,
+    ) -> tuple[float, np.ndarray]:
+        """Return the exact capture timestamp paired with the selected frame."""
         assert self._frame_capturing_start, (
             "Frame capturing is not started. Call connect() first."
         )
@@ -233,7 +247,7 @@ class BaseCamera(Camera, ABC):
                 and latest is not None
                 and time.monotonic() - latest[0] <= max_age
             ):
-                return latest[1].copy()
+                return latest[0], latest[1].copy()
         for attempt in range(1, max(attempts, 1) + 1):
             try:
                 deadline = time.monotonic() + timeout
@@ -242,7 +256,7 @@ class BaseCamera(Camera, ABC):
                         timeout=max(0.0, deadline - time.monotonic())
                     )
                     if max_age is None or time.monotonic() - captured_at <= max_age:
-                        return frame
+                        return captured_at, frame
             except queue.Empty:
                 get_logger().warning(
                     "Camera %s produced no frame within %.2fs "
@@ -265,6 +279,7 @@ class BaseCamera(Camera, ABC):
     def _capture_frames(self) -> None:
         while self._frame_capturing_start:
             time.sleep(1 / self._camera_info.fps)
+            self._frame_read_monotonic_ns = None
             try:
                 has_frame, frame = self._read_frame()
             except Exception as e:
@@ -281,7 +296,11 @@ class BaseCamera(Camera, ABC):
                     self._camera_info.name,
                 )
                 break
-            captured_at = time.monotonic()
+            captured_at = (
+                self._frame_read_monotonic_ns / 1_000_000_000
+                if self._frame_read_monotonic_ns is not None
+                else time.monotonic()
+            )
             self._latest_frame = (captured_at, frame.copy())
             if not self._frame_queue.empty():
                 try:

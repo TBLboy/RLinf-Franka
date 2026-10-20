@@ -53,6 +53,11 @@ class RelativeFrame(gym.Wrapper):
 
         obs, reward, done, truncated, info = self.env.step(transformed_action)
 
+        if "post_guard_action" in info:
+            info["post_guard_action_base"] = np.array(info["post_guard_action"], copy=True)
+            info["post_guard_action"] = self.transform_action_inv(info["post_guard_action"])
+            info["post_guard_action_frame"] = "end_effector_pre_step"
+
         # Report intervention actions in the wrapper's public frame.
         if "intervene_action" in info:
             info["intervene_action"] = self.transform_action_inv(

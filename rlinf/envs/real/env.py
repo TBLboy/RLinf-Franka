@@ -282,6 +282,18 @@ class RealWorldEnv(gym.Env):
         state = raw_obs["state"]
         full_states = np.concatenate([state[k] for k in sorted(state)], axis=-1)
         obs["states"] = full_states
+        if "timestamps" in raw_obs:
+            obs["timestamps"] = raw_obs["timestamps"]
+            # Preserve named state vectors and independent acquisition times for
+            # offline alignment; the flattened policy state remains unchanged.
+            # Copy, because frame wrappers edit obs["state"] in place.
+            obs["training_state"] = {
+                key: np.array(value, copy=True) for key, value in state.items()
+            }
+            obs["raw_state"] = {
+                key: np.array(value, copy=True)
+                for key, value in raw_obs.get("robot_state", state).items()
+            }
 
         frames = raw_obs["frames"]
         if self.main_image_key not in frames:

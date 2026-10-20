@@ -137,6 +137,10 @@ class RobotiqGripper(BaseGripper):
         self._client = None
         self._slave_kwarg = "slave"
         self._cached_position: int = 0  # raw 0-255
+        self._last_state_read_monotonic_ns = 0
+        self._last_command_raw_position = None
+        self._last_send_started_monotonic_ns = 0
+        self._last_send_completed_monotonic_ns = 0
         self._is_open_flag: bool = True
         self._activated: bool = False
 
@@ -184,15 +188,39 @@ class RobotiqGripper(BaseGripper):
         is fully open and 255 is fully closed.
         """
         opening = np.clip(width, 0.0, self._max_width) / self._max_width
-        self._goto(position=int(round(255 * (1.0 - opening))), speed=speed, force=0.5)
+        raw_position = int(round(255 * (1.0 - opening)))
+        self._goto(position=raw_position, speed=speed, force=0.5)
 
     @property
     def position(self) -> float:
         """Current opening width in metres."""
         status = self._read_status()
         if status is not None:
+            self._last_state_read_monotonic_ns = time.monotonic_ns()
             self._cached_position = status["position"]
         return self._max_width * (1.0 - self._cached_position / 255.0)
+
+    @property
+    def observation_features(self) -> dict:
+        return {
+            **super().observation_features,
+            "state_read_monotonic_ns": {"shape": (), "dtype": "int64"},
+        }
+
+    def get_observation(self) -> dict:
+        state = self.get_state()
+        return {
+            "state": state,
+            "state_read_monotonic_ns": self._last_state_read_monotonic_ns,
+        }
+
+    def get_last_command_metadata(self) -> dict:
+        """Return the last completed Modbus target and host send interval."""
+        return {
+            "raw_position": self._last_command_raw_position,
+            "send_started_monotonic_ns": self._last_send_started_monotonic_ns,
+            "send_completed_monotonic_ns": self._last_send_completed_monotonic_ns,
+        }
 
     @property
     def max_width(self) -> float:
@@ -257,7 +285,10 @@ class RobotiqGripper(BaseGripper):
         reg1 = pos
         # Reg 2: (speed << 8) | force
         reg2 = (spd << 8) | frc
+        self._last_send_started_monotonic_ns = time.monotonic_ns()
         self._write_output_regs(reg0, reg1, reg2)
+        self._last_send_completed_monotonic_ns = time.monotonic_ns()
+        self._last_command_raw_position = pos
 
     def _write_output_regs(self, reg0: int, reg1: int, reg2: int) -> None:
         self._client.write_registers(

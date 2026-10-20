@@ -99,6 +99,7 @@ class FrankaEnvConfig:
 
     camera_names: Optional[dict[str, str]] = None
     camera_fps: int = 15
+    capture_timestamps: bool = False
     enable_camera_player: bool = True
     # Per-camera [top, left, bottom, right] crop fractions, keyed by serial.
     camera_crop_regions: Optional[dict[str, list[float]]] = None
@@ -223,6 +224,11 @@ class FrankaEnv(gym.Env):
         #: Cropped frames from the most recent whole-robot reading.
         self._last_frames: dict[str, np.ndarray] = {}
         self._last_depths: dict[str, np.ndarray] = {}
+        self._last_camera_timestamps_ns: dict[str, int] = {}
+        self._last_camera_raw_batches: dict[str, list[dict[str, Any]]] = {}
+        self._last_camera_raw_overflow: dict[str, bool] = {}
+        self._last_robot_read_monotonic_ns = 0
+        self._last_gripper_read_monotonic_ns = 0
         if not self.config.is_dummy:
             self._reset_pose = np.concatenate(
                 [
@@ -374,7 +380,8 @@ class FrankaEnv(gym.Env):
                 h6,
             ]
         """
-        start_time = time.time()
+        start_time = time.monotonic()
+        step_started_ns = time.monotonic_ns()
 
         action = np.clip(action, self.action_space.low, self.action_space.high)
         xyz_delta = action[:3]
@@ -385,7 +392,9 @@ class FrankaEnv(gym.Env):
         )
 
         is_ee_action_effective = True
+        command_info = {}
         if not self.config.is_dummy:
+            command_origin = self._franka_state.tcp_pose.copy()
             self.next_position[3:] = (
                 R.from_euler("xyz", action[3:6] * self.config.action_scale[1])
                 * R.from_quat(self._franka_state.tcp_pose[3:].copy())
@@ -394,18 +403,57 @@ class FrankaEnv(gym.Env):
             # Apply the end-effector command before moving the arm.
             ee_action = action[6:]
             is_ee_action_effective = self._end_effector_action(ee_action)
+            gripper_command = (
+                self._end_effector.get_last_command_metadata()
+                if self.config.continuous_gripper
+                and callable(getattr(self._end_effector, "get_last_command_metadata", None))
+                else None
+            )
 
-            self._move_action(self._clip_position_to_safety_box(self.next_position))
+            command = self._move_action(self._clip_position_to_safety_box(self.next_position))
+            if self.config.capture_timestamps:
+                actual_pose = np.asarray(command["tcp_pose"], dtype=np.float64)
+                rotation_delta = (
+                    R.from_quat(actual_pose[3:])
+                    * R.from_quat(command_origin[3:]).inv()
+                ).as_euler("xyz")
+                actual_action = np.concatenate((
+                    (actual_pose[:3] - command_origin[:3]) / self.config.action_scale[0],
+                    rotation_delta / self.config.action_scale[1],
+                    np.asarray(
+                        [-(gripper_command["raw_position"] / 255.0)]
+                        if gripper_command and gripper_command["raw_position"] is not None
+                        else action[6:], dtype=np.float64
+                    ),
+                ))
+                command_info = {
+                    "post_guard_tcp_pose": command["tcp_pose"],
+                    "post_guard_action": actual_action.astype(np.float32),
+                    "post_guard_action_frame": "robot_base",
+                    "post_guard_send_started_monotonic_ns": command["send_started_monotonic_ns"],
+                    "post_guard_send_completed_monotonic_ns": command["send_completed_monotonic_ns"],
+                }
+                if gripper_command is not None:
+                    command_info["gripper_command_metadata"] = gripper_command
 
         self._num_steps += 1
-        step_time = time.time() - start_time
-        time.sleep(max(0, (1.0 / self.config.step_frequency) - step_time))
+        command_finished_ns = time.monotonic_ns()
 
         if not self.config.is_dummy:
             self._franka_state = self._read_robot()
         else:
             self._franka_state = self._franka_state
+        read_finished_ns = time.monotonic_ns()
         observation = self._get_observation()
+        if self.config.capture_timestamps:
+            self._drain_camera_raw_frames()
+            command_info["camera_raw_batches"] = self._last_camera_raw_batches
+            command_info["camera_raw_overflow"] = self._last_camera_raw_overflow
+            command_info["stream_periods_ns"] = {
+                **{info.name: round(1e9 / info.fps) for info in self._camera_infos},
+                **dict.fromkeys(("robot", "gripper", "action"),
+                                round(1e9 / self.config.step_frequency)),
+            }
 
         # Reward evaluation also updates the success hold counter.
         reward = self._calc_step_reward(observation, is_ee_action_effective)
@@ -417,7 +465,20 @@ class FrankaEnv(gym.Env):
 
         truncated = self._num_steps >= self.config.max_num_steps
         reward *= self.config.reward_scale
-        return observation, reward, terminated, truncated, {}
+        processing_finished_ns = time.monotonic_ns()
+        # Device reads and observation processing consume the same step budget.
+        remaining = 1.0 / self.config.step_frequency - (time.monotonic() - start_time)
+        if remaining > 0:
+            time.sleep(remaining)
+        if self.config.capture_timestamps:
+            command_info["step_timing_ns"] = {
+                "step_started": step_started_ns,
+                "command_finished": command_finished_ns,
+                "read_finished": read_finished_ns,
+                "processing_finished": processing_finished_ns,
+                "step_finished": time.monotonic_ns(),
+            }
+        return observation, reward, terminated, truncated, command_info
 
     @property
     def num_steps(self) -> int:
@@ -425,8 +486,14 @@ class FrankaEnv(gym.Env):
 
     def get_tcp_pose(self) -> np.ndarray:
         """Return the current TCP pose ``[x, y, z, qx, qy, qz, qw]``."""
-        self._franka_state = self._read_robot()
-        return self._franka_state.tcp_pose
+        # Teleoperation needs fresh arm context, not another camera queue read.
+        # Keep end-effector fields from the last complete observation intact.
+        if not self.config.is_dummy:
+            reading = self._arm.get_observation()
+            for name, value in reading.items():
+                if hasattr(self._franka_state, name):
+                    setattr(self._franka_state, name, value)
+        return self._franka_state.tcp_pose.copy()
 
     def get_action_scale(self) -> np.ndarray:
         """Return the action scale ``[pos_scale, ori_scale, gripper_scale]``."""
@@ -700,30 +767,31 @@ class FrankaEnv(gym.Env):
             for camera_info in self._camera_infos
             if camera_info.enable_depth
         ]
+        state_space = gym.spaces.Dict(
+            {
+                "tcp_pose": gym.spaces.Box(
+                    -np.inf, np.inf, shape=(obs_tcp_pose_dim,)
+                ),
+                "tcp_vel": gym.spaces.Box(-np.inf, np.inf, shape=(6,)),
+                "arm_joint_position": gym.spaces.Box(
+                    -np.inf, np.inf, shape=(7,)
+                ),
+                "arm_joint_velocity": gym.spaces.Box(
+                    -np.inf, np.inf, shape=(7,)
+                ),
+                "arm_joint_torque": gym.spaces.Box(
+                    -np.inf, np.inf, shape=(7,)
+                ),
+                ee_state_key: gym.spaces.Box(
+                    ee_low, ee_high, shape=(self._ee_interface.state_dim,)
+                ),
+                "tcp_force": gym.spaces.Box(-np.inf, np.inf, shape=(3,)),
+                "tcp_torque": gym.spaces.Box(-np.inf, np.inf, shape=(3,)),
+            }
+        )
         self.observation_space = gym.spaces.Dict(
             {
-                "state": gym.spaces.Dict(
-                    {
-                        "tcp_pose": gym.spaces.Box(
-                            -np.inf, np.inf, shape=(obs_tcp_pose_dim,)
-                        ),
-                        "tcp_vel": gym.spaces.Box(-np.inf, np.inf, shape=(6,)),
-                        "arm_joint_position": gym.spaces.Box(
-                            -np.inf, np.inf, shape=(7,)
-                        ),
-                        "arm_joint_velocity": gym.spaces.Box(
-                            -np.inf, np.inf, shape=(7,)
-                        ),
-                        "arm_joint_torque": gym.spaces.Box(
-                            -np.inf, np.inf, shape=(7,)
-                        ),
-                        ee_state_key: gym.spaces.Box(
-                            ee_low, ee_high, shape=(self._ee_interface.state_dim,)
-                        ),
-                        "tcp_force": gym.spaces.Box(-np.inf, np.inf, shape=(3,)),
-                        "tcp_torque": gym.spaces.Box(-np.inf, np.inf, shape=(3,)),
-                    }
-                ),
+                "state": state_space,
                 "frames": gym.spaces.Dict(
                     {
                         camera_info.name: gym.spaces.Box(
@@ -733,6 +801,25 @@ class FrankaEnv(gym.Env):
                     }
                 ),
             }
+            | ({
+                "robot_state": copy.deepcopy(state_space),
+                "timestamps": gym.spaces.Dict(
+                    {
+                        "robot_read_monotonic_ns": gym.spaces.Box(
+                            0, np.iinfo(np.int64).max - 1, shape=(), dtype=np.int64
+                        ),
+                        "gripper_read_monotonic_ns": gym.spaces.Box(
+                            0, np.iinfo(np.int64).max - 1, shape=(), dtype=np.int64
+                        ),
+                        **{
+                            f"camera_{info.name}_monotonic_ns": gym.spaces.Box(
+                                0, np.iinfo(np.int64).max - 1, shape=(), dtype=np.int64
+                            )
+                            for info in self._camera_infos
+                        },
+                    }
+                )
+            } if self.config.capture_timestamps else {})
             | (
                 {
                     "depths": gym.spaces.Dict(
@@ -839,6 +926,13 @@ class FrankaEnv(gym.Env):
             path.rsplit(".", 1)[-1]: camera
             for path, camera in self.robot.parts_of_type(Camera).items()
         }
+        if self.config.capture_timestamps:
+            for name, camera in self._cameras.items():
+                if not callable(getattr(camera, "drain_raw_frames", None)):
+                    raise RuntimeError(
+                        "capture_timestamps needs a camera backend that archives raw "
+                        f"frames; {name} ({type(camera).__name__}) does not"
+                    )
 
     def close(self) -> None:
         """Release all hardware resources including cameras and video player."""
@@ -1033,14 +1127,15 @@ class FrankaEnv(gym.Env):
 
         self._franka_state: FrankaRobotState = self._read_robot()
 
-    def _move_action(self, position: np.ndarray) -> None:
+    def _move_action(self, position: np.ndarray) -> dict[str, Any]:
         if self.config.is_dummy:
             self._logger.info("Executing dummy action towards %s.", position)
-            return
+            return {"tcp_pose": position}
         self._clear_error()
         # Commanding the named part rather than the driver is what lets this
         # env run on any arm backend that accepts a Cartesian target.
-        self.robot.send_action({"arm": {"tcp_pose": position.astype(np.float32)}})
+        applied = self.robot.send_action({"arm": {"tcp_pose": position.astype(np.float32)}})
+        return applied["arm"]
 
     def _read_robot(self) -> FrankaRobotState:
         """Read every part once and refresh the cached arm and frame state.
@@ -1050,9 +1145,39 @@ class FrankaEnv(gym.Env):
         connections answer at the same time instead of in turn.
         """
         reading = self.robot.get_observation()
+        self._last_robot_read_monotonic_ns = int(
+            reading["arm"].get("state_read_monotonic_ns", 0)
+        )
+        self._last_gripper_read_monotonic_ns = int(
+            reading["end_effector"].get("state_read_monotonic_ns", 0)
+        )
         self._franka_state = self._state_from(reading)
         self._last_frames, self._last_depths = self._frames_from(reading)
+        self._last_camera_timestamps_ns = {
+            name: int(reading[name].get("captured_monotonic_ns", 0))
+            for name in self._cameras
+        }
         return self._franka_state
+
+    def _drain_camera_raw_frames(self) -> None:
+        """Drain archival camera buffers once per collection step, not on reads."""
+        self._last_camera_raw_batches = {}
+        self._last_camera_raw_overflow = {}
+        for name, camera in self._cameras.items():
+            reading = camera.drain_raw_frames()
+            batches = []
+            for sample in reading.get("raw_frames", []):
+                info = next(info for info in self._camera_infos if info.name == name)
+                shape = self.observation_space["frames"][name].shape
+                _, training_frame = self._crop_frame(
+                    sample["value"], shape[:2][::-1], crop_region=info.crop_region
+                )
+                batches.append({
+                    "timestamp_ns": sample["timestamp_ns"],
+                    "value": np.ascontiguousarray(training_frame[..., ::-1]),
+                })
+            self._last_camera_raw_batches[name] = batches
+            self._last_camera_raw_overflow[name] = bool(reading.get("raw_frame_overflow", False))
 
     def _state_from(self, reading: dict[str, Any]) -> FrankaRobotState:
         """Fill the arm state this env carries from one robot reading."""
@@ -1097,6 +1222,16 @@ class FrankaEnv(gym.Env):
                 "state": state,
                 "frames": frames,
             }
+            if self.config.capture_timestamps:
+                observation["robot_state"] = copy.deepcopy(state)
+                observation["timestamps"] = {
+                    "robot_read_monotonic_ns": self._last_robot_read_monotonic_ns,
+                    "gripper_read_monotonic_ns": self._last_gripper_read_monotonic_ns,
+                    **{
+                        f"camera_{name}_monotonic_ns": timestamp
+                        for name, timestamp in self._last_camera_timestamps_ns.items()
+                    },
+                }
             if self._last_depths:
                 observation["depths"] = self._last_depths
             return copy.deepcopy(observation)

@@ -36,13 +36,15 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 import pickle
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 import numpy as np
+from timestamp_alignment import AlignmentError, align_streams
 
 RELEASE_ROOT = Path(__file__).resolve().parent.parent
 REPO_ROOT = RELEASE_ROOT
@@ -63,7 +65,7 @@ def parse_args() -> argparse.Namespace:
                         help="包含 collected_data/ 的采集运行目录；可重复")
     parser.add_argument("--repo-id", required=True, help="LeRobot dataset repo id")
     parser.add_argument("--robot-type", default="panda")
-    parser.add_argument("--fps", type=int, default=10)
+    parser.add_argument("--fps", type=int, default=30, choices=[30])
     parser.add_argument("--task", default=None,
                         help="覆盖任务描述；默认取 pickle 里的 task_descriptions")
     parser.add_argument("--only-success", action="store_true",
@@ -94,6 +96,57 @@ def as_hwc(image: Any) -> np.ndarray | None:
     if array.dtype != np.uint8:
         array = (array * 255).astype(np.uint8) if array.max() <= 1.0 else array.astype(np.uint8)
     return np.ascontiguousarray(array)
+
+
+def camera_training_image(value: Any) -> np.ndarray:
+    """Reproduce the live camera transforms from an archived UVC frame."""
+    if not isinstance(value, dict):
+        image = as_hwc(value)
+        if image is None:
+            raise AlignmentError("相机图像缺失")
+        return image
+    import cv2
+
+    frame = value.get("frame")
+    resolution = value.get("resolution")
+    eye = value.get("eye")
+    if (not isinstance(frame, np.ndarray) or frame.ndim != 3
+            or frame.shape[2] != 3 or frame.dtype != np.uint8
+            or not isinstance(resolution, (tuple, list)) or len(resolution) != 2
+            or eye not in ("left", "right")):
+        raise AlignmentError("原始 UVC 图像或相机变换参数无效")
+    width, height = resolution
+    if not isinstance(width, int) or not isinstance(height, int) or width <= 0 or height <= 0:
+        raise AlignmentError("相机分辨率无效")
+    half = frame.shape[1] // 2
+    if half == 0:
+        raise AlignmentError("原始 UVC 图像宽度无效")
+    frame = frame[:, :half] if eye == "left" else frame[:, half:]
+    h, w = frame.shape[:2]
+    if w / h > width / height:
+        new_w = max(1, int(round(h * width / height)))
+        left = (w - new_w) // 2
+        frame = frame[:, left:left + new_w]
+    elif w / h < width / height:
+        new_h = max(1, int(round(w * height / width)))
+        top = (h - new_h) // 2
+        frame = frame[top:top + new_h, :]
+    if (frame.shape[1], frame.shape[0]) != (width, height):
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+    h, w = frame.shape[:2]
+    crop = value.get("crop_region")
+    if crop is None:
+        size = min(h, w)
+        y, x = (h - size) // 2, (w - size) // 2
+        frame = frame[y:y + size, x:x + size]
+    else:
+        if (not isinstance(crop, (tuple, list)) or len(crop) != 4
+                or not (0 <= crop[0] < crop[2] <= 1 and 0 <= crop[1] < crop[3] <= 1)):
+            raise AlignmentError("相机裁剪参数无效")
+        frame = frame[int(h * crop[0]):int(h * crop[2]), int(w * crop[1]):int(w * crop[3])]
+    if frame.size == 0:
+        raise AlignmentError("相机裁剪结果为空")
+    return np.ascontiguousarray(cv2.resize(frame, (128, 128), interpolation=cv2.INTER_LINEAR)[..., ::-1])
 
 
 def extra_views(image: Any) -> dict[str, np.ndarray]:
@@ -129,7 +182,88 @@ def extra_views(image: Any) -> dict[str, np.ndarray]:
 
 def episode_frames(data: dict[str, Any], task_override: str | None,
                    stats: dict[str, int] | None = None) -> list[dict[str, Any]]:
-    """Build the LeRobot frame list for one pickle episode."""
+    """Align independently timed raw streams before building training frames."""
+    raw = data.get("raw_streams")
+    boundaries = data.get("episode_bounds_monotonic_ns")
+    periods = data.get("stream_periods_ns")
+    required = ("global", "wrist", "robot", "gripper", "action")
+    if not isinstance(raw, dict) or not isinstance(boundaries, dict) or not isinstance(periods, dict):
+        raise AlignmentError("缺少原始独立时间流、episode 边界或采样周期；不能按索引伪造对齐")
+    losses = data.get("raw_stream_losses", {})
+    if losses:
+        raise AlignmentError(f"原始流缓冲溢出或丢失：{losses}")
+    streams = {}
+    for name in required:
+        samples = raw.get(name)
+        if not isinstance(samples, list) or not samples:
+            raise AlignmentError(f"{name}: 缺少必需原始数据流")
+        try:
+            streams[name] = [(s["timestamp_ns"], s["value"]) for s in samples]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise AlignmentError(f"{name}: 原始样本必须包含 timestamp_ns 和 value") from exc
+    try:
+        rows = align_streams(
+            streams, periods, episode_start_ns=boundaries["start"],
+            episode_end_ns=boundaries["end"], fps=30,
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        if isinstance(exc, AlignmentError):
+            raise
+        raise AlignmentError("episode 边界格式无效") from exc
+
+    frames = []
+    for i, (_, selected) in enumerate(rows):
+        robot = selected["robot"]
+        action = selected["action"]
+        if not isinstance(robot, dict) or not isinstance(robot.get("state_fields"), dict) or not isinstance(action, dict) or action.get("action") is None:
+            raise AlignmentError(f"grid={rows[i][0]}: robot state 或 post-guard action 缺失")
+        fields = dict(robot["state_fields"])
+        segment_id = action.get("segment_id", 0)
+        if isinstance(segment_id, bool) or not isinstance(segment_id, int) or not 0 <= segment_id <= 255:
+            raise AlignmentError("segment_id must be an integer in [0, 255]")
+        expected = {
+            "arm_joint_position": 7,
+            "arm_joint_torque": 7,
+            "arm_joint_velocity": 7,
+            "tcp_force": 3,
+            "tcp_pose": 6,
+            "tcp_torque": 3,
+            "tcp_vel": 6,
+        }
+        if set(fields) != set(expected):
+            raise AlignmentError(f"grid={rows[i][0]}: robot 状态字段不完整或未知：{sorted(fields)}")
+        for name, size in expected.items():
+            value = to_numpy(fields[name])
+            if value is None or value.size != size or not np.isfinite(value).all():
+                raise AlignmentError(f"grid={rows[i][0]}: robot.{name} 缺失、维度错误或非有限值")
+        gripper = to_numpy(selected["gripper"])
+        command = to_numpy(action["action"])
+        if gripper is None or gripper.size != 1 or not np.isfinite(gripper).all():
+            raise AlignmentError(f"grid={rows[i][0]}: gripper 状态无效")
+        if command is None or command.size != 7 or not np.isfinite(command).all():
+            raise AlignmentError(f"grid={rows[i][0]}: post-guard action 无效")
+        fields["gripper_position"] = selected["gripper"]
+        state = np.concatenate([to_numpy(fields[key]).reshape(-1) for key in sorted(fields)])
+        image, wrist = camera_training_image(selected["global"]), camera_training_image(selected["wrist"])
+        if image is None or wrist is None:
+            raise AlignmentError(f"grid={rows[i][0]}: 相机图像缺失")
+        frames.append({
+            "image": image,
+            "extra_view_image": wrist,
+            "state": state.astype(np.float32),
+            "actions": command.reshape(-1).astype(np.float32),
+            "task": task_override or str(data.get("task_description", "unknown task")),
+            "is_success": np.array([bool(data.get("success", False))], dtype=bool),
+            "done": np.array([i == len(rows) - 1], dtype=bool),
+            "segment_id": np.array([segment_id], dtype=np.uint8),
+            "intervene_flag": np.array([bool(action.get("intervene_flag", False))], dtype=bool),
+        })
+    return frames
+
+
+def legacy_episode_frames(data: dict[str, Any], task_override: str | None,
+                          stats: dict[str, int] | None = None) -> list[dict[str, Any]]:
+    """Historical index-based conversion, not used by the strict CLI."""
     observations = data["observations"]
     infos = data["infos"]
     steps = min(len(observations) - 1, len(infos) - 1)
@@ -192,7 +326,7 @@ def episode_frames(data: dict[str, Any], task_override: str | None,
     return frames
 
 
-def collect_episodes(run_dirs: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
+def collect_episodes(run_dirs: list[Path]) -> list[Path]:
     episodes = []
     for run_dir in run_dirs:
         data_dir = run_dir / "collected_data"
@@ -200,8 +334,7 @@ def collect_episodes(run_dirs: list[Path]) -> list[tuple[Path, dict[str, Any]]]:
             print(f"[警告] {run_dir} 下没有 collected_data/，跳过", file=sys.stderr)
             continue
         for path in sorted(data_dir.glob("*.pkl")):
-            with path.open("rb") as handle:
-                episodes.append((path, pickle.load(handle)))
+            episodes.append(path)
     return episodes
 
 
@@ -218,25 +351,32 @@ def main() -> int:
 
     converted, skipped, view_keys = [], [], set()
     stats: dict[str, int] = {}
-    for path, data in episodes:
+    for path in episodes:
+        with path.open("rb") as handle:
+            data = pickle.load(handle)
         if args.only_success and not bool(data.get("success", False)):
             skipped.append(path.name)
             continue
-        frames = episode_frames(data, args.task, stats)
+        try:
+            frames = episode_frames(data, args.task, stats)
+        except AlignmentError as exc:
+            print(f"[错误] {path}: 时间对齐失败：{exc}", file=sys.stderr)
+            return 1
         if not frames:
             skipped.append(path.name)
             continue
         for key in frames[0]:
             if key.startswith("extra_view_image"):
                 view_keys.add(key)
-        converted.append((path.name, frames))
+        converted.append((path, len(frames)))
+        sample = frames[0]
+        del data, frames
 
     if not converted:
         print("[错误] 没有可导出的 episode", file=sys.stderr)
         return 1
 
-    lengths = [len(f) for _, f in converted]
-    sample = converted[0][1][0]
+    lengths = [length for _, length in converted]
     print(f"[信息] 可导出 {len(converted)} 条，长度 {min(lengths)}~{max(lengths)} 步，"
           f"共 {sum(lengths)} 帧")
     print(f"[信息] 主图 {sample['image'].shape}  state {sample['state'].shape}  "
@@ -263,8 +403,38 @@ def main() -> int:
 
     view_shapes = {k: tuple(sample[k].shape) for k in sorted(view_keys)}
     writer = LeRobotDatasetWriter()
+    from rlinf.data.storage.lerobot.paths import default_hf_lerobot_home
+
+    destination = (default_hf_lerobot_home() / args.repo_id).resolve()
+    if destination.exists():
+        raise FileExistsError(f"Refusing to overwrite dataset: {destination}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging_parent = Path(tempfile.mkdtemp(prefix=".lerobot-partial-", dir=destination.parent))
+    staging = staging_parent / "dataset"
+    try:
+        def load_frames():
+            for path, _ in converted:
+                with path.open("rb") as handle:
+                    data = pickle.load(handle)
+                frames = episode_frames(data, args.task)
+                del data
+                yield path.name, frames
+
+        _write_dataset(writer, args, sample, view_shapes, load_frames(), staging)
+        staging.rename(destination)
+    finally:
+        if writer.dataset is not None:
+            image_writer = getattr(writer.dataset, "image_writer", None)
+            if image_writer is not None:
+                image_writer.stop()
+        shutil.rmtree(staging_parent)
+    print(f"[信息] 完成。repo_id={args.repo_id}")
+    return 0
+
+
+def _write_dataset(writer, args, sample, view_shapes, converted, staging):
     writer.create(
-        repo_id=args.repo_id,
+        repo_id=str(staging),
         robot_type=args.robot_type,
         fps=args.fps,
         image_shape=tuple(sample["image"].shape),
@@ -276,13 +446,13 @@ def main() -> int:
         # Every converted frame now has a segment_id: real values for newly
         # collected pickle, explicit zero compatibility values for old pickle.
         has_segment_id=True,
+        image_writer_processes=0,
+        image_writer_threads=2,
     )
     for name, frames in converted:
         writer.add_episode(frames)
         print(f"[信息] 已写入 {name}（{len(frames)} 帧）")
     writer.finalize()
-    print(f"[信息] 完成。repo_id={args.repo_id}")
-    return 0
 
 
 if __name__ == "__main__":

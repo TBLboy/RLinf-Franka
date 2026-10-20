@@ -164,6 +164,66 @@ def test_a_hardware_free_env_repeats_with_a_seed(module_name, class_name, overri
     assert not np.array_equal(observe(7), observe(8)), "a different seed must differ"
 
 
+@pytest.mark.parametrize("work_seconds", [0.02, 0.05])
+def test_franka_step_rate_budget_includes_observation(work_seconds, monkeypatch):
+    import rlinf.envs.real.franka.base as module
+    from rlinf.robotics.parts.arms.franka import FrankaRobotState
+
+    clock = [0.0]
+    sleeps = []
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock[0])
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock[0] += seconds
+
+    monkeypatch.setattr(module.time, "sleep", sleep)
+    env = FrankaEnv.__new__(FrankaEnv)
+    env.config = SimpleNamespace(
+        is_dummy=True, capture_timestamps=False, action_scale=[0.04, 0.3, 1],
+        step_frequency=30, max_num_steps=100, reward_scale=1,
+    )
+    env.action_space = gym.spaces.Box(-1.0, 1.0, shape=(7,))
+    env._franka_state = FrankaRobotState()
+    env._num_steps = 0
+
+    def observation():
+        assert not sleeps, "sleep must not precede observation work"
+        clock[0] += work_seconds
+        return {"state": {}}
+
+    env._get_observation = observation
+    env._calc_step_reward = lambda obs, effective: 0.0
+    env.step(np.zeros(7))
+    assert clock[0] == pytest.approx(max(work_seconds, 1 / 30))
+    assert len(sleeps) == (1 if work_seconds < 1 / 30 else 0)
+
+
+def test_franka_tcp_context_reads_only_arm():
+    from rlinf.robotics.parts.arms.franka import FrankaRobotState
+
+    pose = np.array([0.4, 0.1, 0.3, 0, 0, 0, 1.0])
+
+    class Arm:
+        def get_observation(self):
+            return {"tcp_pose": pose.copy(), "arm_joint_position": np.ones(7)}
+
+    env = FrankaEnv.__new__(FrankaEnv)
+    env.config = SimpleNamespace(is_dummy=False)
+    env._arm = Arm()
+    env._franka_state = FrankaRobotState(gripper_position=0.042)
+    # No robot/camera/gripper connection is available to this context read.
+    result = env.get_tcp_pose()
+    np.testing.assert_array_equal(result, pose)
+    np.testing.assert_array_equal(env._franka_state.arm_joint_position, np.ones(7))
+    assert env._franka_state.gripper_position == 0.042
+    result[:] = 0
+    np.testing.assert_array_equal(env._franka_state.tcp_pose, pose)
+    env.config.is_dummy = True
+    del env._arm
+    np.testing.assert_array_equal(env.get_tcp_pose(), pose)
+
+
 def test_a_franka_observation_comes_from_one_snapshot():
     """Every field a policy sees must describe the same instant.
 
@@ -448,7 +508,7 @@ def test_the_vector_env_keeps_stepping_a_terminated_env():
 def _turtle2_camera_check(camera_ids, ready):
     """Run _check_cameras against a rig with the given cameras."""
     env = Turtle2Env.__new__(Turtle2Env)
-    env.config = SimpleNamespace(is_dummy=False)
+    env.config = SimpleNamespace(is_dummy=False, capture_timestamps=True)
     env.hardware = SimpleNamespace(camera_ids=list(camera_ids))
     env._camera_parts = lambda: [
         SimpleNamespace(is_ready=lambda state=state: state) for state in ready
@@ -851,9 +911,12 @@ def test_franka_observation_keeps_measured_joint_states():
     from rlinf.robotics.parts.arms.franka import FrankaRobotState
 
     env = FrankaEnv.__new__(FrankaEnv)
-    env.config = SimpleNamespace(is_dummy=False)
+    env.config = SimpleNamespace(is_dummy=False, capture_timestamps=True)
     env._last_frames = {"global": np.zeros((128, 128, 3), dtype=np.uint8)}
     env._last_depths = {}
+    env._last_robot_read_monotonic_ns = 123
+    env._last_gripper_read_monotonic_ns = 124
+    env._last_camera_timestamps_ns = {"global": 100}
     env._franka_state = FrankaRobotState(
         arm_joint_position=np.arange(7, dtype=float),
         arm_joint_velocity=np.arange(7, dtype=float) + 10,
@@ -862,6 +925,9 @@ def test_franka_observation_keeps_measured_joint_states():
     env._end_effector = SimpleNamespace(is_hand=False, state_dim=1)
 
     observation = env._get_observation()
+
+    assert observation["timestamps"]["robot_read_monotonic_ns"] == 123
+    assert observation["timestamps"]["camera_global_monotonic_ns"] == 100
 
     state = observation["state"]
     assert state["arm_joint_position"] == pytest.approx(np.arange(7))
@@ -1576,7 +1642,10 @@ def test_pico_episode_controls_translate_events_to_collection_boundaries():
             return {}, {}
 
         def step(self, action):
-            return {}, 0.0, False, False, {"pico_control_event": next(self.events)}
+            return {}, 0.0, False, False, {
+                "pico_control_event": next(self.events),
+                "pico_control_event_monotonic_ns": 123456,
+            }
 
     wrapper = PicoStartEndTimeout(Env())
 
@@ -1585,11 +1654,13 @@ def test_pico_episode_controls_translate_events_to_collection_boundaries():
     assert info["record_reset"] is True
     assert info["pre_record"] is False
     assert info["pico_event_status"] == "accepted"
+    assert info["episode_event_monotonic_ns"] == 123456
 
     _, reward, terminated, truncated, info = wrapper.step(None)
     assert (reward, terminated, truncated) == (1.0, True, False)
     assert info["pre_record"] is False
     assert info["pico_event_status"] == "accepted"
+    assert info["episode_event_monotonic_ns"] == 123456
 
     wrapper.reset()
     _, reward, terminated, truncated, info = wrapper.step(None)
@@ -1602,6 +1673,311 @@ def test_pico_episode_controls_translate_events_to_collection_boundaries():
     assert info["pre_record"] is True
     assert info["pico_event_status"] == "accepted"
 
+
+def test_vector_env_preserves_pico_packet_batches():
+    from gymnasium import spaces
+    from rlinf.envs.real.venv import NoAutoResetSyncVectorEnv
+
+    packet = {"timestamp_ns": 123, "value": {"buttons": {"X": False}}}
+
+    class Env(gym.Env):
+        observation_space = spaces.Box(0, 1, shape=(1,), dtype=np.float32)
+        action_space = spaces.Box(0, 1, shape=(1,), dtype=np.float32)
+
+        def reset(self, *, seed=None, options=None):
+            return np.zeros(1, dtype=np.float32), {}
+
+        def step(self, action):
+            return np.zeros(1, dtype=np.float32), 0.0, False, False, {
+                "pico_raw_packets": [packet], "pico_raw_packet_overflow": False,
+            }
+
+    env = NoAutoResetSyncVectorEnv([Env])
+    try:
+        env.reset()
+        _, _, _, _, info = env.step(np.zeros((1, 1), dtype=np.float32))
+        assert info["pico_raw_packets"][0] == [packet]
+        assert not info["pico_raw_packet_overflow"][0]
+    finally:
+        env.close()
+
+
+def test_capture_timestamps_survives_gym_vector_batching():
+    """Runner fields are added after actual vector batching, not before it."""
+    import gymnasium as gym
+    from rlinf.envs.real.venv import NoAutoResetSyncVectorEnv
+    from rlinf.envs.real.env import RealWorldEnv
+
+    from rlinf.envs.real.franka.base import FrankaEnv
+
+    env = FrankaEnv.__new__(FrankaEnv)
+    env.config = SimpleNamespace(
+        ee_pose_limit_min=np.full(6, -1.0),
+        ee_pose_limit_max=np.full(6, 1.0),
+        capture_timestamps=True,
+    )
+    env._end_effector = SimpleNamespace(
+        action_dim=1, state_dim=1, is_gripper=True, is_hand=False
+    )
+    env._camera_infos = [SimpleNamespace(name="global", enable_depth=False)]
+    env._init_action_obs_spaces()
+    space = env.observation_space
+
+    assert "raw_state" not in space.spaces
+
+    def observation():
+        return {
+            "robot_state": {key: np.zeros(s.shape) for key, s in space["robot_state"].spaces.items()},
+            "state": {key: np.zeros(s.shape) for key, s in space["state"].spaces.items()},
+            "frames": {"global": np.zeros((128, 128, 3), dtype=np.uint8)},
+            "timestamps": {
+                key: np.int64(7) for key in space["timestamps"].spaces
+            },
+        }
+
+    class Env(gym.Env):
+        observation_space = space
+        action_space = env.action_space
+
+        def reset(self, *, seed=None, options=None):
+            return observation(), {}
+
+        def step(self, action):
+            return observation(), 0.0, False, False, {}
+
+    vector = NoAutoResetSyncVectorEnv([Env])
+    runner = RealWorldEnv.__new__(RealWorldEnv)
+    runner.main_image_key = "global"
+    runner.task_descriptions = ["test"]
+    try:
+        batched, _ = vector.reset()
+        wrapped = runner._wrap_obs(batched)
+        assert set(wrapped) >= {"raw_state", "timestamps", "states"}
+        assert set(wrapped["raw_state"]) == set(space["state"].spaces)
+        batched, *_ = vector.step(np.zeros((1, 1)))
+        wrapped = runner._wrap_obs(batched)
+        assert set(wrapped["raw_state"]) == set(space["state"].spaces)
+        assert int(wrapped["timestamps"]["robot_read_monotonic_ns"][0]) == 7
+        batched["state"]["tcp_pose"][...] = 99
+        assert bool((wrapped["raw_state"]["tcp_pose"] == 0).all())
+    finally:
+        vector.close()
+
+
+@pytest.mark.parametrize("record_task", [False, True])
+def test_collection_training_buffer_excludes_archival_metadata(record_task):
+    from examples.embodiment.collect_real_data import DataCollector
+
+    collector = SimpleNamespace(cfg=SimpleNamespace(
+        runner=SimpleNamespace(record_task_description=record_task)
+    ))
+    obs = {
+        "states": np.zeros((1, 40), dtype=np.float32),
+        "main_images": torch.zeros((1, 128, 128, 3), dtype=torch.uint8),
+        "raw_state": {"tcp_pose": torch.zeros((1, 7))},
+        "training_state": {"tcp_pose": torch.zeros((1, 6))},
+        "timestamps": {"robot_read_monotonic_ns": torch.tensor([123])},
+        "task_descriptions": ["pick"],
+    }
+    result = DataCollector._process_obs(collector, obs)
+    assert set(result) == {"states", "main_images"} | ({"task_descriptions"} if record_task else set())
+    assert result["states"].shape == (1, 40)
+    assert "timestamps" in obs and "task_descriptions" in obs
+    result["main_images"].fill_(1)
+    assert not obs["main_images"].any()
+
+
+def test_training_camera_archive_matches_live_preprocessing():
+    import cv2
+    from rlinf_ext.cameras import ZEDUVCCamera
+    from rlinf.robotics.parts.cameras.base import CameraInfo
+
+    info = CameraInfo(name="global", serial_number="unused", resolution=(8, 6))
+    camera = ZEDUVCCamera(info)
+    stereo = np.arange(12 * 24 * 3, dtype=np.uint16).reshape(12, 24, 3).astype(np.uint8)
+    camera._device = SimpleNamespace(read=lambda: (True, stereo.copy()))
+    camera._cv2 = cv2
+    ok, live = camera._read_frame()
+    assert ok
+    env = FrankaEnv.__new__(FrankaEnv)
+    env._cameras = {"global": camera}
+    env._camera_infos = [SimpleNamespace(name="global", crop_region=None)]
+    env.observation_space = gym.spaces.Dict({"frames": gym.spaces.Dict({
+        "global": gym.spaces.Box(0, 255, (128, 128, 3), dtype=np.uint8)
+    })})
+    env._drain_camera_raw_frames()
+    sample = env._last_camera_raw_batches["global"][0]
+    _, expected = env._crop_frame(live, (128, 128))
+    np.testing.assert_array_equal(sample["value"], expected[..., ::-1])
+    assert sample["timestamp_ns"] == camera._frame_read_monotonic_ns
+    assert sample["value"].shape == (128, 128, 3)
+    assert sample["value"].nbytes == 49152
+
+
+def test_collector_keeps_bounded_preroll(tmp_path):
+    from rlinf.envs.wrappers.collect_episode import CollectEpisode
+
+    collector = CollectEpisode(SimpleNamespace(close=lambda: None), str(tmp_path))
+    def batch(value):
+        result = np.empty(1, dtype=object)
+        result[0] = value
+        return result
+
+    try:
+        for index in range(1, 5):
+            starting = index == 4
+            info = {
+                "pre_record": np.array([not starting]),
+                "record_reset": np.array([starting]),
+                "keyboard_event": batch("record_start" if starting else None),
+                "episode_event_monotonic_ns": np.array([index * 100]),
+                "stream_periods_ns": {"global": 100},
+                "camera_raw_batches": {"global": batch([
+                    {"timestamp_ns": index * 100, "value": np.zeros((2, 2, 3), dtype=np.uint8)}
+                ])},
+            }
+            collector._record_step(np.zeros((1, 7)), {}, np.array([0.]),
+                                   np.array([False]), np.array([False]), info)
+        raw = collector._raw_episodes[0]
+        assert raw.start_ns == 400
+        assert [x["timestamp_ns"] for x in raw.streams["global"]] == [200, 300, 400]
+        assert collector._raw_preroll[0] is None
+    finally:
+        collector.close()
+
+
+def test_raw_episode_collector_saves_independent_streams(tmp_path):
+    import pickle
+    from rlinf.envs.wrappers.collect_episode import CollectEpisode
+
+    class Env:
+        def close(self):
+            pass
+
+    collector = CollectEpisode(Env(), str(tmp_path), num_envs=1, export_format="pickle")
+    image = np.zeros((2, 2, 3), dtype=np.uint8)
+
+    def step(t, event, done):
+        obs = {
+            "states": np.zeros((1, 40), dtype=np.float32),
+            "main_images": image[None],
+            "extra_view_images": image[None, None],
+            "raw_state": {
+                "tcp_pose": np.zeros((1, 6), dtype=np.float32),
+                "tcp_vel": np.zeros((1, 6), dtype=np.float32),
+                "tcp_force": np.zeros((1, 3), dtype=np.float32),
+                "tcp_torque": np.zeros((1, 3), dtype=np.float32),
+                "arm_joint_position": np.zeros((1, 7), dtype=np.float32),
+                "arm_joint_velocity": np.zeros((1, 7), dtype=np.float32),
+                "arm_joint_torque": np.zeros((1, 7), dtype=np.float32),
+                "gripper_position": np.array([[0.5]], dtype=np.float32),
+            },
+            "timestamps": {"robot_read_monotonic_ns": np.array([t]),
+                           "gripper_read_monotonic_ns": np.array([t])},
+        }
+        def batch(x):
+            result = np.empty(1, dtype=object)
+            result[0] = x
+            return result
+        info = {
+            "keyboard_event": batch(event),
+            "stream_periods_ns": dict.fromkeys(("global", "wrist", "robot", "gripper", "action"), 33_333_333),
+            "episode_event_monotonic_ns": np.array([t]),
+            "record_reset": np.array([event == "record_start"]),
+            "pre_record": np.array([False]),
+            "segment_advance": np.array([event == "record_success"]),
+            "camera_raw_batches": {
+                "global": batch([{"timestamp_ns": t, "value": image}]),
+                "wrist": batch([{"timestamp_ns": t, "value": image}]),
+            },
+            "camera_raw_overflow": {"global": np.array([False]), "wrist": np.array([False])},
+            "pico_raw_packets": batch([{"timestamp_ns": t, "value": {"button": event}}]),
+            "pico_raw_packet_overflow": np.array([False]),
+            "post_guard_tcp_pose": np.zeros((1, 7)),
+            "post_guard_action": np.zeros((1, 7)),
+            "post_guard_send_started_monotonic_ns": np.array([t]),
+            "post_guard_send_completed_monotonic_ns": np.array([t + 1]),
+        }
+        collector._record_step(np.zeros((1, 7)), obs, np.array([1.0 if done else 0.0]),
+                               np.array([done]), np.array([False]), info)
+        assert "main_images" in obs
+        assert all("main_images" not in entry for entry in collector._buffers[0]["observations"])
+        if done:
+            collector._flush_episode(0, True)
+
+    try:
+        step(1_000_000_000, "record_start", False)
+        step(1_033_333_333, "record_success", True)
+    finally:
+        collector.close()
+    files = list(tmp_path.glob("*.pkl"))
+    assert len(files) == 1
+    with files[0].open("rb") as f:
+        raw = pickle.load(f)
+    assert set(raw["raw_streams"]) == {"global", "wrist", "robot", "gripper", "pico", "action"}
+    assert raw["episode_bounds_monotonic_ns"] == {"start": 1_000_000_000, "end": 1_033_333_333}
+    assert [sample["value"]["segment_id"] for sample in raw["raw_streams"]["action"]] == [0, 1]
+    assert raw["segment_ids"][-1] == 1
+
+    import importlib.util
+    import sys
+    scripts = str(_ROOT / "scripts")
+    sys.path.insert(0, scripts)
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "post_process_to_lerobot", _ROOT / "scripts/post_process_to_lerobot.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        import cv2
+        stereo = np.arange(12 * 24 * 3, dtype=np.uint16).reshape(12, 24, 3).astype(np.uint8)
+        archived = {"frame": stereo.copy(), "eye": "left", "resolution": (8, 6), "crop_region": None}
+        eye = stereo[:, :12]
+        eye = eye[1:10, :]
+        live = cv2.resize(eye, (8, 6), interpolation=cv2.INTER_AREA)
+        live = live[:, 1:7]
+        expected = cv2.resize(live, (128, 128), interpolation=cv2.INTER_LINEAR)[..., ::-1]
+        np.testing.assert_array_equal(module.camera_training_image(archived), expected)
+        np.testing.assert_array_equal(archived["frame"], stereo)
+        frames = module.episode_frames(raw, "test")
+        assert len(frames) == 2
+        assert set(frames[0]) == {
+            "image", "extra_view_image", "state", "actions", "task",
+            "is_success", "done", "segment_id", "intervene_flag",
+        }
+        assert frames[-1]["done"].item()
+        assert frames[0]["state"].shape == (40,)
+        assert frames[0]["state"][21] == 0.5
+        original = files[0].read_bytes()
+        output = tmp_path / "export"
+        writer = module.LeRobotDatasetWriter()
+        module._write_dataset(
+            writer, SimpleNamespace(robot_type="franka", fps=30), frames[0],
+            {"extra_view_image": frames[0]["extra_view_image"].shape},
+            [("episode", frames)], output,
+        )
+        try:
+            from lerobot.datasets.lerobot_dataset import LeRobotDataset
+        except ModuleNotFoundError:
+            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+        dataset = LeRobotDataset(str(output), root=output)
+        assert len(dataset) == 2
+        np.testing.assert_allclose(dataset[0]["state"], frames[0]["state"])
+        np.testing.assert_allclose(dataset[0]["actions"], frames[0]["actions"])
+        assert dataset[1]["segment_id"].item() == 1
+        assert dataset[1]["done"].item()
+        assert tuple(dataset[0]["image"].shape) == (3, 2, 2)
+        assert tuple(dataset[0]["extra_view_image"].shape) == (3, 2, 2)
+        assert files[0].read_bytes() == original
+        raw["raw_streams"]["wrist"] = []
+        with pytest.raises(module.AlignmentError, match="wrist"):
+            module.episode_frames(raw, "test")
+        assert files[0].read_bytes() == original
+        raw["raw_stream_losses"] = {"global": 1}
+        with pytest.raises(module.AlignmentError, match="溢出"):
+            module.episode_frames(raw, "test")
+    finally:
+        sys.path.remove(scripts)
 
 def test_episode_wrappers_report_through_the_logger():
     episode_dir = _ROOT / "rlinf" / "envs" / "real" / "episode"

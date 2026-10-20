@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import glob
 import os
+import threading
+import time
+from collections import deque
 from typing import Any, Optional, Union
 
 import numpy as np
@@ -68,6 +71,32 @@ class ZEDUVCCamera(BaseCamera):
             )
         self._out_w, self._out_h = camera_info.resolution
         self._cv2: Any = None
+        self._raw_lock = threading.Lock()
+        self._raw_frames = deque()
+        self._raw_frame_limit = 300
+        self._raw_frame_overflow = False
+
+    @property
+    def observation_features(self) -> dict:
+        """Include unresampled camera frames and explicit loss status."""
+        return {
+            **super().observation_features,
+            "captured_monotonic_ns": {"shape": (), "dtype": "int64"},
+        }
+
+    def get_observation(self, *args: Any, **kwargs: Any) -> dict:
+        """Return the live observation without consuming the archival buffer."""
+        captured_at, frame = self._get_timestamped_frame(*args, **kwargs)
+        return {"frame": frame, "captured_monotonic_ns": int(captured_at * 1e9)}
+
+    def drain_raw_frames(self) -> dict:
+        """Atomically take all frame/timestamp pairs since the previous drain."""
+        with self._raw_lock:
+            result = {"raw_frames": list(self._raw_frames),
+                      "raw_frame_overflow": self._raw_frame_overflow}
+            self._raw_frames.clear()
+            self._raw_frame_overflow = False
+        return result
 
     def _open(self) -> Any:
         """Open the V4L2 device and put it in YUYV at the capture size."""
@@ -158,6 +187,7 @@ class ZEDUVCCamera(BaseCamera):
         these frames.
         """
         ok, frame = self._device.read()
+        self._frame_read_monotonic_ns = time.monotonic_ns()
         if not ok or frame is None:
             return False, None
 
@@ -177,6 +207,14 @@ class ZEDUVCCamera(BaseCamera):
             frame = self._cv2.resize(
                 frame, (self._out_w, self._out_h), interpolation=self._cv2.INTER_AREA
             )
+        # Retain only the selected eye; the environment applies its training crop.
+        with self._raw_lock:
+            if len(self._raw_frames) >= self._raw_frame_limit:
+                self._raw_frame_overflow = True
+            else:
+                self._raw_frames.append(
+                    {"timestamp_ns": self._frame_read_monotonic_ns, "value": frame.copy()}
+                )
         return True, frame
 
     @staticmethod
