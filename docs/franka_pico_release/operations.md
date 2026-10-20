@@ -11,6 +11,19 @@ bash scripts/run_pico_session.sh
 
 The collection launcher owns the Ray lifecycle and the Pico publisher lifecycle.
 
+## 30 Hz control-rate experiment
+
+The active Release configuration requests a 30 Hz RLinf environment cadence:
+read robot state and cameras, process the newest Pico command, send the next
+TCP target, and write one collection sample. It does not change Franky's
+separate real-time impedance loop. Collection metadata also declares 30 Hz.
+
+This is an operator-approved experiment, not a hardware-validated setting.
+Before collecting usable demonstrations, test unloaded and within a small
+workspace; stop immediately for stale motion, vibration, unexpected force,
+Desk warnings, or errors. The 10 Hz baseline is tagged locally as
+`backup/vr-controls-20261020`.
+
 ## Pico operator controls
 
 The supported single-arm collection controls are:

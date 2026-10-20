@@ -6,6 +6,7 @@ import subprocess
 from pathlib import Path
 
 
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -60,3 +61,11 @@ def test_launcher_requires_both_configured_camera_video_nodes() -> None:
     assert "ZED_2i_OV0001-video-index0" in launcher
     assert "ZED-M-video-index0" in launcher
     assert "相机视频节点缺失" in launcher
+
+
+def test_release_config_keeps_control_and_dataset_rate_aligned() -> None:
+    config = (
+        ROOT / "release_configs/embodiment/realworld_collect_data_pico_single_franka.yaml"
+    ).read_text()
+    assert "step_frequency: 30.0" in config
+    assert "fps: 30" in config

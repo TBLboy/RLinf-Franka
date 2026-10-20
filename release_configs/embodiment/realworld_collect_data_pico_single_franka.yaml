@@ -125,6 +125,10 @@ env:
 
     override_cfg:
       is_dummy: false
+      # Operator-approved control-rate experiment. This is the maximum RLinf
+      # read-state / command / record cadence, not Franky's real-time impedance
+      # loop. Validate unloaded and in a small workspace before data collection.
+      step_frequency: 30.0
       task_description: "franka single-arm pico teleoperation demo collection"
       # 与 env.eval.max_episode_steps 保持一致（看门狗阈值同源）
       max_num_steps: 3000
@@ -234,4 +238,4 @@ env:
       # 人类演示全部保留；成功判定在这里没有意义
       only_success: False
       robot_type: "panda"
-      fps: 10
+      fps: 30
